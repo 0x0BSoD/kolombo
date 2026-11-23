@@ -9,15 +9,49 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode},
     layout::Constraint,
-    style::{Modifier, Style},
-    widgets::{Block, Clear, Paragraph, Row, Table, TableState},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
 };
-use std::time::Duration;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    time::Duration,
+};
 
 struct Ns {
     name: String,
     phase: String,
     created: i64, // unix seconds
+    labels: Vec<(String, String)>, // user labels only, sorted by key
+}
+
+/// True for `kubernetes.io/...` and `*.kubernetes.io/...` keys (system-managed).
+fn is_system_label(key: &str) -> bool {
+    key.split_once('/')
+        .is_some_and(|(prefix, _)| prefix == "kubernetes.io" || prefix.ends_with(".kubernetes.io"))
+}
+
+/// True for the plain label key `name` (it just repeats the namespace name).
+fn is_name_label(key: &str) -> bool {
+    key == "name"
+}
+
+/// One padded, colored "pill". Same text always gets the same color.
+fn pill(key: &str, value: &str) -> Span<'static> {
+    const PALETTE: [Color; 8] = [
+        Color::Rgb(137, 180, 250),
+        Color::Rgb(166, 227, 161),
+        Color::Rgb(249, 226, 175),
+        Color::Rgb(245, 194, 231),
+        Color::Rgb(148, 226, 213),
+        Color::Rgb(250, 179, 135),
+        Color::Rgb(203, 166, 247),
+        Color::Rgb(243, 139, 168),
+    ];
+    let mut h = DefaultHasher::new(); // fixed keys: stable across runs
+    key.hash(&mut h);
+    let color = PALETTE[(h.finish() % PALETTE.len() as u64) as usize];
+    Span::styled(format!(" {key}={value} "), Style::new().bg(color).fg(Color::Black))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -103,6 +137,15 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
                 name: ns.metadata.name.clone().unwrap_or_default(),
                 phase: ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default(),
                 created: ns.metadata.creation_timestamp.as_ref().map_or(0, |t| t.0.as_second()),
+                labels: ns
+                    .metadata
+                    .labels
+                    .iter()
+                    .flatten() // Option<BTreeMap> -> entries (BTreeMap is already key-sorted)
+                    .filter(|(k, _)| !is_system_label(k))
+                    .filter(|(k, _)| !is_name_label(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             })
             .collect();
         let mut visible = filter(&names, &query, &matcher);
@@ -123,8 +166,25 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
                 .iter()
-                .map(|n| Row::new([n.name.clone(), n.phase.clone(), format_age(now - n.created)]));
-            let widths = [Constraint::Fill(1), Constraint::Length(12), Constraint::Length(6)];
+                .map(|n| {
+                    let mut spans = Vec::new();
+                    for (k, v) in &n.labels {
+                        spans.push(pill(k, v));
+                        spans.push(Span::raw(" "));
+                    }
+                    Row::new([
+                        Cell::from(n.name.clone()),
+                        Cell::from(n.phase.clone()),
+                        Cell::from(format_age(now - n.created)),
+                        Cell::from(Line::from(spans)),
+                    ])
+                });
+            let widths = [
+                Constraint::Fill(1),
+                Constraint::Length(12),
+                Constraint::Length(6),
+                Constraint::Fill(2),
+            ];
             let table = Table::new(rows, widths)
                 .header(
                     Row::new(Column::ALL.map(|c| {
@@ -133,7 +193,9 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
                         } else {
                             c.title().to_string()
                         }
-                    }))
+                    })
+                    .into_iter()
+                    .chain(["LABELS".to_string()]))
                     .style(Style::new().add_modifier(Modifier::BOLD)),
                 )
                 .block(Block::bordered().title(title))
