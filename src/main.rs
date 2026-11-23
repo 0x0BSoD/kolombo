@@ -11,7 +11,7 @@ use kube::{
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyModifiers},
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
@@ -21,7 +21,10 @@ use std::{
     collections::BTreeMap,
     hash::{DefaultHasher, Hash, Hasher},
     process::Command,
-    sync::mpsc::{self, Sender},
+    sync::{
+        Arc, OnceLock,
+        mpsc::{self, Sender},
+    },
     time::{Duration, Instant},
 };
 
@@ -60,37 +63,107 @@ fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>) -> Tabl
         .block(Block::bordered().border_style(dim).title(format!(" {title} ({count}) ")))
 }
 
-/// Fullscreen details: breadcrumb frame, info block, labels table, annotations table.
-fn render_details(frame: &mut Frame, ns: &Namespace, message: &str) {
+/// What the header shows about the connection.
+struct HeaderInfo {
+    context: String,
+    version: Arc<OnceLock<String>>, // filled by a background task; None until the API answers
+}
+
+/// Name of the current kubeconfig context.
+fn current_context() -> String {
+    kube::config::Kubeconfig::read()
+        .ok()
+        .and_then(|c| c.current_context)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+const LIST_HINTS: &[(&str, &str)] = &[
+    ("/", "search"),
+    ("d", "describe"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^n", "new"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("q", "quit"),
+];
+const DETAILS_HINTS: &[(&str, &str)] = &[("e", "edit"), ("y", "yaml"), ("^n", "new"), ("^d", "delete"), ("Esc", "back")];
+const YAML_HINTS: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("g/G", "top/bottom"),
+    ("^d/^u", "page"),
+    ("Space", "fold"),
+    ("v", "select"),
+    ("y", "copy"),
+    ("Y", "copy all"),
+    ("s", "service fields"),
+    ("Esc", "back"),
+];
+const HEADER_HEIGHT: u16 = 2;
+
+/// Fixed top bar on every screen: connection info and breadcrumbs. Keys live behind `?`.
+fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[String]) {
+    let [bar, trail] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let bar_style = Style::new().bg(Color::Rgb(49, 50, 68));
+    let label = bar_style.fg(Color::DarkGray);
+    let value = bar_style.fg(Color::White).add_modifier(Modifier::BOLD);
+
+    frame.render_widget(Block::new().style(bar_style), bar);
+    let version = info.version.get().map_or("…", String::as_str);
+    let left = Line::from(vec![
+        Span::styled(" KOLOMBO ", bold.bg(Color::Cyan).fg(Color::Black)),
+        Span::styled("  context ", label),
+        Span::styled(info.context.clone(), value),
+    ]);
+    let right = Line::from(vec![
+        Span::styled("k8s ", label),
+        Span::styled(version, bar_style.fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(" ", bar_style),
+    ])
+    .right_aligned();
+    frame.render_widget(Paragraph::new(left), bar);
+    frame.render_widget(Paragraph::new(right), bar);
+
+    let mut trail_spans = vec![Span::raw(" ")];
+    for (i, c) in crumbs.iter().enumerate() {
+        if i > 0 {
+            trail_spans.push(Span::styled(" // ", dim));
+        }
+        let style = if i + 1 == crumbs.len() { bold.fg(Color::Cyan) } else { dim };
+        trail_spans.push(Span::styled(c.clone(), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(trail_spans)), trail);
+
+    let help = Line::from(vec![
+        Span::styled("? ", bold.fg(Color::Yellow)),
+        Span::styled("help ", dim),
+    ])
+    .right_aligned();
+    frame.render_widget(Paragraph::new(help), trail);
+}
+
+/// Details pane: info block, labels table, annotations table.
+fn render_details(frame: &mut Frame, area: Rect, ns: &Namespace, message: &str) {
     let m = &ns.metadata;
-    let name = m.name.clone().unwrap_or_default();
     let phase = ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
     let phase_color = if phase == "Active" { Color::Green } else { Color::Yellow };
-    let bold = Style::new().add_modifier(Modifier::BOLD);
     let dim = Style::new().fg(Color::DarkGray);
     let created = m.creation_timestamp.as_ref().map_or(String::new(), |t| {
         format!("{} ({} ago)", t.0, format_age(jiff::Timestamp::now().as_second() - t.0.as_second()))
     });
 
-    // Breadcrumb: Namespaces // <name> // Details
-    let crumbs = Line::from(vec![
-        Span::styled(" Namespaces ", dim),
-        Span::styled("// ", dim),
-        Span::styled(name.clone(), bold.fg(Color::Cyan)),
-        Span::styled(" // ", dim),
-        Span::styled("Details ", bold),
-        Span::styled("(Esc back) ", dim),
-    ]);
-    let outer = Block::bordered().title(crumbs).title_bottom(format!(" {message} "));
-    let inner = outer.inner(frame.area());
-    frame.render_widget(outer, frame.area());
+    let outer = Block::bordered().title(" Details ").title_bottom(format!(" {message} "));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
 
     let [info, labels, annotations] =
-        Layout::vertical([Constraint::Length(6), Constraint::Fill(1), Constraint::Fill(1)]).areas(inner);
+        Layout::vertical([Constraint::Length(5), Constraint::Fill(1), Constraint::Fill(1)]).areas(inner);
 
     let field = |k: &str, v: Span<'static>| Line::from(vec![Span::styled(format!("{k:<10}"), dim), v]);
     let lines = vec![
-        field("Name", Span::styled(name, bold)),
         field("Status", Span::styled(format!("● {phase}"), Style::new().fg(phase_color))),
         field("Created", Span::raw(created)),
         field("UID", Span::raw(m.uid.clone().unwrap_or_default())),
@@ -150,7 +223,16 @@ impl Column {
 async fn main() -> anyhow::Result<()> {
     // Fetch before entering the TUI so errors print on a normal terminal.
     let client = Client::try_default().await?;
-    let api: Api<Namespace> = Api::all(client);
+    let api: Api<Namespace> = Api::all(client.clone());
+    let info = HeaderInfo { context: current_context(), version: Arc::new(OnceLock::new()) };
+    {
+        // Ask for the server version in the background so an unreachable cluster can't block startup.
+        let version = info.version.clone();
+        tokio::spawn(async move {
+            let v = client.apiserver_version().await.map(|i| i.git_version);
+            let _ = version.set(v.unwrap_or_else(|_| "unreachable".into()));
+        });
+    }
     // Informer: the watcher streams events, the reflector mirrors them into `store`.
     let (store, writer) = reflector::store();
     let events = reflector(writer, watcher(api.clone(), watcher::Config::default()))
@@ -162,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
     // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
-    tokio::task::spawn_blocking(move || ratatui::run(|terminal| run_app(terminal, &store, &api, &rt))).await??;
+    tokio::task::spawn_blocking(move || ratatui::run(|terminal| run_app(terminal, &store, &api, &rt, &info))).await??;
     Ok(())
 }
 
@@ -170,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
 enum Modal {
     Delete { name: String, yes: bool }, // `yes` = which button is focused
     New(String),                        // name typed so far
+    Help(&'static [(&'static str, &'static str)]), // key list of the current pane
 }
 
 fn render_modal(frame: &mut Frame, modal: &Modal) {
@@ -190,6 +273,23 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
                 Paragraph::new(text)
                     .centered()
                     .block(Block::bordered().border_style(Style::new().fg(Color::Red)).title(" Delete (y/n, Enter) ")),
+                area,
+            );
+        }
+        Modal::Help(hints) => {
+            let area = frame.area().centered(Constraint::Length(40), Constraint::Length(hints.len() as u16 + 2));
+            frame.render_widget(Clear, area);
+            let lines: Vec<Line> = hints
+                .iter()
+                .map(|(k, d)| {
+                    Line::from(vec![
+                        Span::styled(format!(" {k:<7}"), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(*d, Style::new().fg(Color::Gray)),
+                    ])
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")),
                 area,
             );
         }
@@ -342,6 +442,7 @@ fn run_app(
     store: &Store<Namespace>,
     api: &Api<Namespace>,
     rt: &tokio::runtime::Handle,
+    info: &HeaderInfo,
 ) -> std::io::Result<()> {
     let matcher = SkimMatcherV2::default();
     let mut state = TableState::default().with_selected(Some(0));
@@ -420,19 +521,32 @@ fn run_app(
             viewing = None;
         }
 
+        let (crumbs, hints): (Vec<String>, &'static [(&'static str, &'static str)]) = if let Some(v) = &yaml {
+            (vec!["Namespaces".into(), v.name(), "YAML".into()], YAML_HINTS)
+        } else if let Some(n) = &viewing {
+            (vec!["Namespaces".into(), n.clone(), "Details".into()], DETAILS_HINTS)
+        } else {
+            (vec!["Namespaces".into()], LIST_HINTS)
+        };
+
         terminal.draw(|frame| {
+            let [head, body] = Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Fill(1)]).areas(frame.area());
+            render_header(frame, head, info, &crumbs);
             if let Some(v) = &mut yaml {
-                v.render(frame, &status);
-                return;
-            }
-            if let Some(ns) = &details {
-                render_details(frame, ns, &status);
+                v.render(frame, body, &status);
                 if let Some(m) = &modal {
                     render_modal(frame, m);
                 }
                 return;
             }
-            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, y yaml, ^n new, ^d delete, q quit) ", visible.len(), names.len());
+            if let Some(ns) = &details {
+                render_details(frame, body, ns, &status);
+                if let Some(m) = &modal {
+                    render_modal(frame, m);
+                }
+                return;
+            }
+            let title = format!(" {}/{} ", visible.len(), names.len());
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
                 .iter()
@@ -470,7 +584,7 @@ fn run_app(
                 )
                 .block(Block::bordered().title(title).title_bottom(format!(" {status} ")))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-            frame.render_stateful_widget(table, frame.area(), &mut state);
+            frame.render_stateful_widget(table, body, &mut state);
 
             if let Some(m) = &modal {
                 render_modal(frame, m);
@@ -514,6 +628,7 @@ fn run_app(
                     }
                     _ => Some(Modal::Delete { name, yes }),
                 },
+                Modal::Help(_) => None, // any key closes it
                 Modal::New(mut input) => match key.code {
                     KeyCode::Enter if !input.is_empty() => {
                         let api = api.clone();
@@ -533,6 +648,10 @@ fn run_app(
                     _ => Some(Modal::New(input)),
                 },
             };
+            continue;
+        }
+        if key.code == KeyCode::Char('?') && !typing {
+            modal = Some(Modal::Help(hints));
             continue;
         }
         if let Some(v) = &mut yaml {

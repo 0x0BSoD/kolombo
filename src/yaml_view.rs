@@ -3,6 +3,7 @@
 use k8s_openapi::api::core::v1::Namespace;
 use ratatui::{
     Frame,
+    layout::Rect,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -145,8 +146,11 @@ impl YamlView {
         (lo, end.min(self.lines.len()))
     }
 
-    pub fn render(&mut self, frame: &mut Frame, message: &str) {
-        let area = frame.area();
+    pub fn name(&self) -> String {
+        self.ns.metadata.name.clone().unwrap_or_default()
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, message: &str) {
         self.height = area.height.saturating_sub(2).max(1) as usize;
         let vis = self.visible();
         self.cursor = self.cursor.min(vis.len().saturating_sub(1));
@@ -187,27 +191,21 @@ impl YamlView {
             .collect();
 
         let bold = Style::new().add_modifier(Modifier::BOLD);
-        let name = self.ns.metadata.name.clone().unwrap_or_default();
-        let mut crumbs = vec![
-            Span::styled(" Namespaces ", dim),
-            Span::styled("// ", dim),
-            Span::styled(name, bold.fg(Color::Cyan)),
-            Span::styled(" // ", dim),
-            Span::styled("YAML ", bold),
-        ];
+        // Mode tags sit top-right; breadcrumbs and key help live in the app header.
+        let mut tags = Vec::new();
         if self.anchor.is_some() {
-            crumbs.push(Span::styled("-- VISUAL -- ", bold.fg(Color::Yellow)));
+            tags.push(Span::styled(" -- VISUAL -- ", bold.fg(Color::Yellow)));
         }
         if !self.show_all {
-            crumbs.push(Span::styled("(service fields hidden) ", dim));
+            tags.push(Span::styled(" service fields hidden ", dim));
         }
-        let bottom = if message.is_empty() {
-            " j/k g/G ^d/^u move · space fold · v select · y copy · Y copy all · s service fields · Esc back ".to_string()
-        } else {
-            format!(" {message} ")
-        };
         frame.render_widget(
-            Paragraph::new(rows).block(Block::bordered().title(Line::from(crumbs)).title_bottom(bottom)),
+            Paragraph::new(rows).block(
+                Block::bordered()
+                    .title(" YAML ")
+                    .title(Line::from(tags).right_aligned())
+                    .title_bottom(format!(" {message} ")),
+            ),
             area,
         );
     }
