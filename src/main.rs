@@ -1,6 +1,10 @@
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use k8s_openapi::{api::core::v1::Namespace, jiff};
-use kube::{Api, Client, api::ListParams};
+use futures::StreamExt;
+use kube::{
+    Api, Client,
+    runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
+};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{self, Event, KeyCode},
@@ -8,6 +12,7 @@ use ratatui::{
     style::{Modifier, Style},
     widgets::{Block, Clear, Paragraph, Row, Table, TableState},
 };
+use std::time::Duration;
 
 struct Ns {
     name: String,
@@ -45,19 +50,16 @@ async fn main() -> anyhow::Result<()> {
     // Fetch before entering the TUI so errors print on a normal terminal.
     let client = Client::try_default().await?;
     let api: Api<Namespace> = Api::all(client);
-    let names: Vec<Ns> = api
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
-        .map(|ns| Ns {
-            name: ns.metadata.name.unwrap_or_default(),
-            phase: ns.status.and_then(|s| s.phase).unwrap_or_default(),
-            created: ns.metadata.creation_timestamp.map_or(0, |t| t.0.as_second()),
-        })
-        .collect();
+    // Informer: the watcher streams events, the reflector mirrors them into `store`.
+    let (store, writer) = reflector::store();
+    let events = reflector(writer, watcher(api, watcher::Config::default()))
+        .default_backoff() // retry with backoff on errors instead of ending
+        .applied_objects();
+    // The stream does nothing unless polled, so drive it in a background task.
+    tokio::spawn(events.for_each(|_| async {}));
 
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
-    ratatui::run(|terminal| run_app(terminal, &names))?;
+    ratatui::run(|terminal| run_app(terminal, &store))?;
     Ok(())
 }
 
@@ -84,7 +86,7 @@ fn format_age(secs: i64) -> String {
     }
 }
 
-fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> {
+fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io::Result<()> {
     let matcher = SkimMatcherV2::default();
     let mut state = TableState::default().with_selected(Some(0));
     let mut query = String::new();
@@ -93,7 +95,17 @@ fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> 
     let mut ascending = true;
 
     loop {
-        let mut visible = filter(names, &query, &matcher);
+        // Snapshot of the informer cache; changes as watch events arrive.
+        let names: Vec<Ns> = store
+            .state()
+            .iter()
+            .map(|ns| Ns {
+                name: ns.metadata.name.clone().unwrap_or_default(),
+                phase: ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default(),
+                created: ns.metadata.creation_timestamp.as_ref().map_or(0, |t| t.0.as_second()),
+            })
+            .collect();
+        let mut visible = filter(&names, &query, &matcher);
         // With a query, fuzzy rank wins; otherwise apply the chosen sort.
         if query.is_empty() {
             visible.sort_by(|a, b| match sort_col {
@@ -141,6 +153,10 @@ fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> 
             }
         })?;
 
+        // Wait up to 250ms for a key; on timeout loop again so the UI redraws with fresh data.
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
         let Event::Key(key) = event::read()? else { continue };
 
         if typing {
