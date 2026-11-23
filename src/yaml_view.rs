@@ -1,6 +1,5 @@
 //! Read-only YAML pane: syntax highlight, folding, vim motions, line selection + copy.
 
-use k8s_openapi::api::core::v1::Namespace;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -24,7 +23,8 @@ pub enum Outcome {
 }
 
 pub struct YamlView {
-    ns: Namespace,
+    name: String,
+    value: Value, // the object as a generic YAML tree, so any resource kind works
     show_all: bool,
     lines: Vec<String>,
     folded: HashSet<usize>, // indexes into `lines` of collapsed blocks
@@ -55,8 +55,8 @@ fn block_end(lines: &[String], i: usize) -> usize {
     j
 }
 
-fn to_lines(ns: &Namespace, show_all: bool) -> Vec<String> {
-    let mut v = serde_yaml_ng::to_value(ns).unwrap_or_default();
+fn to_lines(value: &Value, show_all: bool) -> Vec<String> {
+    let mut v = value.clone();
     if !show_all {
         if let Some(meta) = v.get_mut("metadata").and_then(Value::as_mapping_mut) {
             for k in SERVICE_METADATA {
@@ -121,9 +121,9 @@ fn highlight(line: &str) -> Vec<Span<'static>> {
 }
 
 impl YamlView {
-    pub fn new(ns: Namespace) -> Self {
-        let lines = to_lines(&ns, false);
-        Self { ns, show_all: false, lines, folded: HashSet::new(), cursor: 0, scroll: 0, height: 0, anchor: None }
+    pub fn new(name: String, value: Value) -> Self {
+        let lines = to_lines(&value, false);
+        Self { name, value, show_all: false, lines, folded: HashSet::new(), cursor: 0, scroll: 0, height: 0, anchor: None }
     }
 
     /// Indexes of lines on screen: children of folded blocks are skipped.
@@ -147,7 +147,7 @@ impl YamlView {
     }
 
     pub fn name(&self) -> String {
-        self.ns.metadata.name.clone().unwrap_or_default()
+        self.name.clone()
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, message: &str) {
@@ -230,7 +230,7 @@ impl YamlView {
             }
             KeyCode::Char('s') => {
                 self.show_all = !self.show_all;
-                self.lines = to_lines(&self.ns, self.show_all);
+                self.lines = to_lines(&self.value, self.show_all);
                 self.folded.clear(); // indexes no longer line up
                 self.anchor = None;
                 self.cursor = 0;
@@ -268,11 +268,17 @@ mod tests {
 
     #[test]
     fn hides_service_fields_until_show_all() {
-        let mut ns = Namespace::default();
-        ns.metadata.name = Some("x".into());
-        ns.metadata.uid = Some("u-1".into());
-        let hidden = to_lines(&ns, false).join("\n");
+        let ns = k8s_openapi::api::core::v1::Namespace {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("x".into()),
+                uid: Some("u-1".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let v = serde_yaml_ng::to_value(&ns).unwrap();
+        let hidden = to_lines(&v, false).join("\n");
         assert!(!hidden.contains("uid") && hidden.contains("name: x"));
-        assert!(to_lines(&ns, true).join("\n").contains("uid: u-1"));
+        assert!(to_lines(&v, true).join("\n").contains("uid: u-1"));
     }
 }
