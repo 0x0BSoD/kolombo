@@ -1,4 +1,5 @@
 mod container_view;
+mod drain;
 mod generic_view;
 mod log_view;
 mod nodes;
@@ -621,6 +622,9 @@ const LOG_HINTS: Hints = &[
 ];
 const NODE_HINTS: Hints = &[
     ("Enter", "pods on node"),
+    ("c", "cordon"),
+    ("u", "uncordon"),
+    ("C", "drain"),
     ("d", "describe"),
     ("/", "search"),
     (":", "resource"),
@@ -631,6 +635,8 @@ const NODE_HINTS: Hints = &[
     ("A", "asc/desc"),
     ("Esc", "back"),
 ];
+const NODE_DETAILS_HINTS: Hints =
+    &[("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
 const GENERIC_HINTS: Hints = &[
     ("Enter", "describe"),
     ("/", "search"),
@@ -1009,6 +1015,7 @@ enum Modal {
     Help(Hints),                                            // key list of the current pane
     Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
     Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
+    Drain { node: String, opts: drain::DrainOpts, focus: usize, yes: bool }, // focus 0..=3 = checkboxes, 4 = buttons
     Command { query: String, sel: usize },                              // `:` resource picker
 }
 
@@ -1096,6 +1103,41 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
                     .block(Block::bordered().title(" Logs of (Enter, Esc) ")),
                 area,
                 &mut state,
+            );
+        }
+        Modal::Drain { node, opts, focus, yes } => {
+            let area = frame.area().centered(Constraint::Length(62), Constraint::Length(9));
+            frame.render_widget(Clear, area);
+            let boxes = [
+                (opts.ignore_daemonsets, "Ignore DaemonSets", "their pods are left running"),
+                (opts.force, "Force", "also pods no controller would recreate"),
+                (opts.disable_eviction, "Disable eviction", "delete directly, ignore disruption budgets"),
+                (opts.delete_emptydir, "Delete emptyDir data", "pods using emptyDir lose that data"),
+            ];
+            let mut lines: Vec<Line> = boxes
+                .iter()
+                .enumerate()
+                .map(|(i, (on, label, hint))| {
+                    let row = if *focus == i { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                    Line::from(vec![
+                        Span::styled(format!(" [{}] {label:<21}", if *on { "x" } else { " " }), row),
+                        Span::styled(format!(" {hint}"), Style::new().fg(Color::DarkGray)),
+                    ])
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            let button = |label: &str, active: bool| {
+                let style = if active && *focus == 4 { Style::new().add_modifier(Modifier::REVERSED) } else if active { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+                Span::styled(format!(" {label} "), style)
+            };
+            lines.push(Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]).centered());
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::bordered()
+                        .border_style(Style::new().fg(Color::Red))
+                        .title(format!(" Drain {node}? (Space toggles, y/n) ")),
+                ),
+                area,
             );
         }
         Modal::Command { query, sel } => {
@@ -1801,6 +1843,38 @@ fn run_app(
                         _ => Some(Modal::Namespaces { query, sel, current }),
                     }
                 }
+                Modal::Drain { node, mut opts, focus, yes } => {
+                    let (mut run, mut close) = (false, false);
+                    let toggle = |opts: &mut drain::DrainOpts, i: usize| match i {
+                        0 => opts.ignore_daemonsets = !opts.ignore_daemonsets,
+                        1 => opts.force = !opts.force,
+                        2 => opts.disable_eviction = !opts.disable_eviction,
+                        3 => opts.delete_emptydir = !opts.delete_emptydir,
+                        _ => {}
+                    };
+                    let (mut focus, mut yes) = (focus, yes);
+                    match key.code {
+                        KeyCode::Char('y') => run = true,
+                        KeyCode::Esc | KeyCode::Char('n') => close = true,
+                        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => focus = (focus + 1).min(4),
+                        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => focus = focus.saturating_sub(1),
+                        KeyCode::Char(' ') => toggle(&mut opts, focus),
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if focus == 4 => yes = !yes,
+                        KeyCode::Enter if focus < 4 => toggle(&mut opts, focus),
+                        KeyCode::Enter if yes => run = true,
+                        KeyCode::Enter => close = true, // "No" focused
+                        _ => {}
+                    }
+                    if run {
+                        let (client, label) = (client.clone(), format!("draining {node}"));
+                        spawn_op(rt, &tx, &mut activity, label, drain::drain(client, node, opts));
+                        None
+                    } else if close {
+                        None
+                    } else {
+                        Some(Modal::Drain { node, opts, focus, yes })
+                    }
+                }
                 Modal::Command { mut query, sel } => {
                     let sel = sel.min(res_matches.len().saturating_sub(1));
                     match key.code {
@@ -1918,6 +1992,18 @@ fn run_app(
                     }
                 }
                 Some(generic_view::Action::Quit) => return Ok(()),
+                Some(generic_view::Action::Cordon(node)) => {
+                    let (client, label) = (client.clone(), format!("cordoning {node}"));
+                    spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, true).await });
+                }
+                Some(generic_view::Action::Uncordon(node)) => {
+                    let (client, label) = (client.clone(), format!("uncordoning {node}"));
+                    spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, false).await });
+                }
+                Some(generic_view::Action::Drain(node)) => {
+                    modal = Some(Modal::Drain { node, opts: drain::DrainOpts::default(), focus: 4, yes: false });
+                }
+
                 Some(generic_view::Action::NodePods(node)) => {
                     parked = generic.take(); // keep the node list to come back to
                     if let Some(old) = pods.take() {
@@ -2207,6 +2293,18 @@ mod tests {
         term.draw(|f| render_list(f, f.area(), ListKind::Nodes(&m), &[&item], 1, &mut list, "")).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         for want in ["ROLES", "control-plane", "2000m/4000m", "2.0Gi/8.0Gi", "55/110", "10.0.0.5", "v1.30.2", "Ubuntu 24.04", "⣿"] {
+            assert!(text.contains(want), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn drain_popup_shows_the_four_options_and_their_state() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let modal = Modal::Drain { node: "n1".into(), opts: drain::DrainOpts::default(), focus: 4, yes: false };
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| render_modal(f, &modal, &[], &[])).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        for want in ["Drain n1?", "[x] Ignore DaemonSets", "[ ] Force", "[ ] Disable eviction", "[ ] Delete emptyDir data", "Yes", "No"] {
             assert!(text.contains(want), "missing {want}");
         }
     }

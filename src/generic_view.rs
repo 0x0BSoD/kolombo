@@ -2,7 +2,7 @@
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
 use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_HINTS, Hints, NODE_HINTS, Item, ListView, YAML_HINTS, created_secs, created_text,
+    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_HINTS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, Item, ListView, YAML_HINTS, created_secs, created_text,
     field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
 };
 use crate::resources::ResourceInfo;
@@ -30,6 +30,9 @@ pub enum Action {
     Close,
     Quit,
     NodePods(String), // Enter on a node: its pods
+    Cordon(String),
+    Uncordon(String),
+    Drain(String), // opens the drain options popup
     Command, // open the `:` picker
     Copy(String),
     Delete(String), // list key
@@ -225,7 +228,7 @@ impl GenericView {
         if self.yaml.is_some() {
             YAML_HINTS
         } else if self.viewing.is_some() {
-            GENERIC_DETAILS_HINTS
+            if nodes::is_nodes(&self.info) { NODE_DETAILS_HINTS } else { GENERIC_DETAILS_HINTS }
         } else if nodes::is_nodes(&self.info) {
             NODE_HINTS
         } else {
@@ -282,11 +285,15 @@ impl GenericView {
             }
             return None;
         }
+        let node = nodes::is_nodes(&self.info);
         if let Some(k) = self.viewing.clone() {
             match key.code {
                 KeyCode::Char('d') if ctrl => return Some(Action::Delete(k)),
                 KeyCode::Char('e') => return Some(Action::Edit(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
+                KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
+                KeyCode::Char('u') if node => return Some(Action::Uncordon(k)),
+                KeyCode::Char('C') if node => return Some(Action::Drain(k)),
                 KeyCode::Char(':') => return Some(Action::Command),
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => self.viewing = None,
                 _ => {}
@@ -320,7 +327,10 @@ impl GenericView {
             KeyCode::Char('>') => self.list.sort_col = self.list.sort_col.step(1),
             KeyCode::Char('<') => self.list.sort_col = self.list.sort_col.step(-1),
             KeyCode::Char('A') => self.list.ascending = !self.list.ascending,
-            KeyCode::Enter if nodes::is_nodes(&self.info) => return selected.map(Action::NodePods),
+            KeyCode::Enter if node => return selected.map(Action::NodePods),
+            KeyCode::Char('c') if node => return selected.map(Action::Cordon),
+            KeyCode::Char('u') if node => return selected.map(Action::Uncordon),
+            KeyCode::Char('C') if node => return selected.map(Action::Drain),
             KeyCode::Char('d') | KeyCode::Enter => self.viewing = selected,
             KeyCode::Char('y') => {
                 if let Some(k) = selected {
