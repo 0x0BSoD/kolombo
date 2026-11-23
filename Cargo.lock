@@ -1280,6 +1280,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "ratatui",
+ "serde",
  "serde_yaml_ng",
  "tokio",
 ]

@@ -1,5 +1,7 @@
 mod container_view;
 mod log_view;
+mod resources;
+mod state;
 mod yaml_view;
 
 use futures::StreamExt;
@@ -571,6 +573,7 @@ type Hints = &'static [(&'static str, &'static str)];
 const LIST_HINTS: Hints = &[
     ("Enter", "pods"),
     ("/", "search"),
+    (":", "resource"),
     ("d", "describe"),
     ("e", "edit"),
     ("y", "yaml"),
@@ -585,6 +588,7 @@ const POD_HINTS: Hints = &[
     ("/", "search"),
     ("Enter", "logs"),
     ("^n", "namespace"),
+    (":", "resource"),
     ("d", "describe"),
     ("e", "edit"),
     ("y", "yaml"),
@@ -765,7 +769,8 @@ fn pill(key: &str, value: &str) -> Span<'static> {
     Span::styled(format!(" {key}={value} "), Style::new().bg(color).fg(Color::Black))
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum Column {
     Name,
     Status,
@@ -792,8 +797,8 @@ struct ListView {
 }
 
 impl ListView {
-    fn new() -> Self {
-        Self { table: TableState::default().with_selected(Some(0)), query: String::new(), sort_col: Column::Name, ascending: true }
+    fn sorted(sort: state::Sort) -> Self {
+        Self { table: TableState::default().with_selected(Some(0)), query: String::new(), sort_col: sort.column, ascending: sort.ascending }
     }
 }
 
@@ -937,8 +942,21 @@ async fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
     // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
+    let state_path = state::default_path();
+    let (state, notice) = state::State::load(state_path.as_deref());
+    // Resource types come from API discovery in the background; `:` works with a short built-in list until then.
+    let resource_types: Arc<OnceLock<Vec<resources::ResourceInfo>>> = Arc::default();
+    {
+        let (client, out) = (client.clone(), resource_types.clone());
+        tokio::spawn(async move {
+            let found = resources::discover(&client).await;
+            if !found.is_empty() {
+                let _ = out.set(found);
+            }
+        });
+    }
     tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| run_app(terminal, &store, &api, &client, &rt, &info))
+        ratatui::run(|terminal| run_app(terminal, &store, &api, &client, &rt, &info, state, state_path.as_deref(), notice, &resource_types))
     })
     .await??;
     Ok(())
@@ -951,6 +969,7 @@ enum Modal {
     Help(Hints),                                            // key list of the current pane
     Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
     Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
+    Command { query: String, sel: usize },                              // `:` resource picker
 }
 
 fn container_names(pod: &Pod) -> Vec<String> {
@@ -967,7 +986,7 @@ fn open_logs(pods: &Option<PodLevel>, rt: &tokio::runtime::Handle, name: String,
     (!containers.is_empty()).then(|| log_view::LogView::new(p.api_for(&name), rt.clone(), name, containers))
 }
 
-fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String]) {
+fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_matches: &[resources::ResourceInfo]) {
     match modal {
         Modal::Delete { name, kind, yes } => {
             let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(5));
@@ -1018,6 +1037,42 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String]) {
                 area,
                 &mut state,
             );
+        }
+        Modal::Command { query, sel } => {
+            // Same box as the search popup, with the matching resource types listed under it.
+            let rows = res_matches.len().min(8) as u16;
+            let list_h = if rows > 0 { rows + 2 } else { 0 };
+            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3 + list_h));
+            frame.render_widget(Clear, area);
+            let [input, list] = Layout::vertical([Constraint::Length(3), Constraint::Length(list_h)]).areas(area);
+            frame.render_widget(Paragraph::new(query.as_str()).block(Block::bordered().title(" Resource ")), input);
+            let dim = Style::new().fg(Color::DarkGray);
+            let items: Vec<ListItem> = res_matches
+                .iter()
+                .map(|r| {
+                    let open = r.target().is_some();
+                    let name = Style::new().fg(if open { Color::Reset } else { Color::DarkGray });
+                    let group = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
+                    let mut spans = vec![Span::styled(r.name.clone(), name.add_modifier(Modifier::BOLD))];
+                    if !r.short_names.is_empty() {
+                        spans.push(Span::styled(format!(" ({})", r.aliases()), dim));
+                    }
+                    spans.push(Span::styled(format!("  {group}"), dim));
+                    if !open {
+                        spans.push(Span::styled("  soon", dim));
+                    }
+                    ListItem::new(Line::from(spans))
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some((*sel).min(res_matches.len().saturating_sub(1))));
+            if list_h > 0 {
+                frame.render_stateful_widget(
+                    List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)).block(Block::bordered().border_style(dim)),
+                    list,
+                    &mut state,
+                );
+            }
+            frame.set_cursor_position((input.x + 1 + query.chars().count() as u16, input.y + 1));
         }
         Modal::Namespaces { query, sel, current } => {
             let height = (ns_matches.len() as u16 + 4).min(frame.area().height * 7 / 10).max(5);
@@ -1319,10 +1374,15 @@ fn run_app(
     client: &Client,
     rt: &tokio::runtime::Handle,
     info: &HeaderInfo,
+    mut state: state::State,
+    state_path: Option<&std::path::Path>,
+    notice: String,
+    resource_types: &OnceLock<Vec<resources::ResourceInfo>>,
 ) -> std::io::Result<()> {
     let matcher = SkimMatcherV2::default();
+    let builtin_types = resources::builtin(); // until discovery answers
     // lists[0] is namespaces; a pod level pushes a second one and pops it on the way back.
-    let mut lists = vec![ListView::new()];
+    let mut lists = vec![ListView::sorted(state.sort.namespaces)];
     let mut pods: Option<PodLevel> = None;
     let mut typing = false; // true while the search popup is open
     let mut viewing: Option<String> = None; // object shown in the details view (of the active level)
@@ -1344,7 +1404,18 @@ fn run_app(
     let mut logs: Option<log_view::LogView> = None; // log pane, when open
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
-    let mut message = String::new(); // result of the last action, cleared on next key
+    let mut message = notice; // result of the last action, cleared on next key
+
+    let mut saved = state.clone(); // what the file holds right now
+    // Reopen where the last run stopped: the pod list of the remembered namespace (or of all).
+    if state.namespace.is_some() || state.all_namespaces {
+        match state.resource {
+            state::Resource::Pods => {
+                pods = Some(open_pods(client, rt, &tx, &mut activity, state.namespace.clone()));
+                lists.push(ListView::sorted(state.sort.pods));
+            }
+        }
+    }
 
     loop {
         while let Ok(done) = rx.try_recv() {
@@ -1357,6 +1428,22 @@ fn run_app(
         let tick = (started.elapsed().as_millis() / 120) as usize;
         let status = activity.status(tick).unwrap_or_else(|| message.clone());
         let in_pods = pods.is_some();
+
+        // Mirror what is on screen into `state`; write the file only when something changed.
+        state.sort.namespaces = state::Sort::of(&lists[0]);
+        if let Some(l) = lists.get(1) {
+            state.sort.pods = state::Sort::of(l);
+        }
+        state.namespace = pods.as_ref().and_then(|p| p.scope.clone());
+        state.all_namespaces = pods.as_ref().is_some_and(|p| p.scope.is_none());
+        if state != saved {
+            if let Some(path) = state_path {
+                if let Err(e) = state.save(path) {
+                    message = format!("state not saved: {e}");
+                }
+            }
+            saved = state.clone(); // also after a failure, so it is not retried every frame
+        }
         let kind = if in_pods { "pod" } else { "namespace" };
 
         // Snapshot of the active level's informer cache; changes as watch events arrive.
@@ -1381,6 +1468,12 @@ fn run_app(
                     .collect();
                 scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
                 scored.into_iter().map(|(_, n)| n).collect()
+            }
+            _ => vec![],
+        };
+        let res_matches: Vec<resources::ResourceInfo> = match &modal {
+            Some(Modal::Command { query, .. }) => {
+                resources::matches(resource_types.get().unwrap_or(&builtin_types), query, &matcher)
             }
             _ => vec![],
         };
@@ -1473,7 +1566,7 @@ fn run_app(
                 render_list(frame, body, metrics.as_ref(), &visible, items.len(), list, &status);
             }
             if let Some(m) = &modal {
-                render_modal(frame, m, &ns_matches);
+                render_modal(frame, m, &ns_matches, &res_matches);
             }
             if typing && yaml.is_none() && details.is_none() {
                 // Floating box: 50% wide, 3 rows tall, centered.
@@ -1538,7 +1631,7 @@ fn run_app(
                                     activity.finish(old.loading); // dropping `old` aborts its watchers
                                 }
                                 pods = Some(open_pods(client, rt, &tx, &mut activity, scope));
-                                *lists.last_mut().unwrap() = ListView::new();
+                                *lists.last_mut().unwrap() = ListView::sorted(state.sort.pods);
                                 viewing = None;
                             }
                             None
@@ -1557,6 +1650,44 @@ fn run_app(
                             Some(Modal::Namespaces { sel: usize::from(!query.is_empty()), query, current })
                         }
                         _ => Some(Modal::Namespaces { query, sel, current }),
+                    }
+                }
+                Modal::Command { mut query, sel } => {
+                    let sel = sel.min(res_matches.len().saturating_sub(1));
+                    match key.code {
+                        KeyCode::Enter => {
+                            match res_matches.get(sel) {
+                                None => message = format!("no resource type matches \"{query}\""),
+                                Some(r) => match r.target() {
+                                    Some(resources::Target::Pods) if pods.is_none() => {
+                                        // from the namespace list: the pods of the highlighted namespace
+                                        pods = Some(open_pods(client, rt, &tx, &mut activity, selected.clone()));
+                                        lists.push(ListView::sorted(state.sort.pods));
+                                    }
+                                    Some(resources::Target::Namespaces) if pods.is_some() => {
+                                        if let Some(p) = pods.take() {
+                                            activity.finish(p.loading);
+                                        }
+                                        lists.pop();
+                                    }
+                                    Some(_) => {} // already there
+                                    None => message = format!("{} is not supported yet", r.name),
+                                },
+                            }
+                            None
+                        }
+                        KeyCode::Esc => None,
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Command { query, sel: (sel + 1).min(res_matches.len().saturating_sub(1)) }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Command { query, sel: sel.saturating_sub(1) }),
+                        KeyCode::Char(c) if !ctrl => {
+                            query.push(c);
+                            Some(Modal::Command { query, sel: 0 })
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            Some(Modal::Command { query, sel: 0 })
+                        }
+                        _ => Some(Modal::Command { query, sel }),
                     }
                 }
                 Modal::Containers { pod, names, sel } => match key.code {
@@ -1687,6 +1818,7 @@ fn run_app(
                     modal = Some(Modal::Namespaces { query: String::new(), sel: 0, current });
                 }
                 KeyCode::Char('/') => typing = true,
+                KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
                 KeyCode::Char('>') => list.sort_col = list.sort_col.step(1),
                 KeyCode::Char('<') => list.sort_col = list.sort_col.step(-1),
                 KeyCode::Char('A') => list.ascending = !list.ascending,
@@ -1733,7 +1865,7 @@ fn run_app(
         }
         if let Some(ns) = enter_pods {
             pods = Some(open_pods(client, rt, &tx, &mut activity, Some(ns)));
-            lists.push(ListView::new());
+            lists.push(ListView::sorted(state.sort.pods));
         }
         if let Some(name) = yaml_target {
             let value = match &pods {
