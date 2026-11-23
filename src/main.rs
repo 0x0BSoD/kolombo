@@ -1,4 +1,5 @@
 mod container_view;
+mod generic_view;
 mod log_view;
 mod resources;
 mod state;
@@ -41,12 +42,14 @@ use yaml_view::{Outcome, YamlView};
 
 /// Everything the generic helpers need from a Kubernetes resource type.
 /// One name instead of a six-line `where` clause on every function.
+/// Any object type the generic helpers (edit, delete, find) can work with. Typed ones like Pod have
+/// `DynamicType = ()`; an untyped DynamicObject carries its ApiResource there instead.
 trait Kind:
-    Resource<DynamicType = ()> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+    Resource<DynamicType: Clone + Eq + Hash> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
 {
 }
 impl<K> Kind for K where
-    K: Resource<DynamicType = ()> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+    K: Resource<DynamicType: Clone + Eq + Hash> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
 {
 }
 
@@ -323,7 +326,8 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
 
 fn status_color(s: &str) -> Color {
     match s {
-        "Running" | "Active" | "Succeeded" | "Completed" => Color::Green,
+        "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
+        | "Established" => Color::Green,
         "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" => Color::Yellow,
         _ if s.starts_with("Init:") => Color::Yellow,
         _ => Color::Red,
@@ -611,6 +615,19 @@ const LOG_HINTS: Hints = &[
     ("h/l", "pan"),
     ("Esc", "back"),
 ];
+const GENERIC_HINTS: Hints = &[
+    ("Enter", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+    ("q", "quit"),
+];
+const GENERIC_DETAILS_HINTS: Hints = &[(":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
 const YAML_HINTS: Hints = &[
     ("j/k", "move"),
     ("g/G", "top/bottom"),
@@ -964,12 +981,32 @@ async fn main() -> anyhow::Result<()> {
 
 /// A popup that grabs all keys until closed.
 enum Modal {
-    Delete { name: String, kind: &'static str, yes: bool }, // `yes` = which button is focused
+    Delete { name: String, kind: String, yes: bool }, // `yes` = which button is focused
     New(String),                                            // name typed so far
     Help(Hints),                                            // key list of the current pane
     Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
     Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
     Command { query: String, sel: usize },                              // `:` resource picker
+}
+
+/// A list of any resource type; the spinner stops when its first full list has arrived.
+fn open_generic(
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    tx: &Sender<Done>,
+    activity: &mut Activity,
+    info: resources::ResourceInfo,
+    scope: Option<String>,
+    sort: state::Sort,
+) -> generic_view::GenericView {
+    let loading = activity.start(format!("loading {}", info.name));
+    let view = generic_view::GenericView::open(rt, client, info, scope, sort, loading);
+    let (store, tx) = (view.store().clone(), tx.clone());
+    rt.spawn(async move {
+        let _ = store.wait_until_ready().await;
+        let _ = tx.send(Done { id: loading, message: None });
+    });
+    view
 }
 
 fn container_names(pod: &Pod) -> Vec<String> {
@@ -1050,17 +1087,13 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
             let items: Vec<ListItem> = res_matches
                 .iter()
                 .map(|r| {
-                    let open = r.target().is_some();
-                    let name = Style::new().fg(if open { Color::Reset } else { Color::DarkGray });
+                    let name = Style::new();
                     let group = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
                     let mut spans = vec![Span::styled(r.name.clone(), name.add_modifier(Modifier::BOLD))];
                     if !r.short_names.is_empty() {
                         spans.push(Span::styled(format!(" ({})", r.aliases()), dim));
                     }
                     spans.push(Span::styled(format!("  {group}"), dim));
-                    if !open {
-                        spans.push(Span::styled("  soon", dim));
-                    }
                     ListItem::new(Line::from(spans))
                 })
                 .collect();
@@ -1249,6 +1282,23 @@ fn find_in<K: Kind>(store: &Store<K>, name: &str) -> Option<Arc<K>> {
         .find(|o| o.meta().name.as_deref() == Some(name) && (ns.is_none() || o.meta().namespace.as_deref() == ns))
 }
 
+/// What a list shows: filtered by the query, or sorted by the chosen column when there is none.
+fn visible_items<'a>(items: &'a [Item], list: &ListView, matcher: &SkimMatcherV2) -> Vec<&'a Item> {
+    let mut visible = filter(items, &list.query, matcher);
+    // With a query, fuzzy rank wins; otherwise apply the chosen sort.
+    if list.query.is_empty() {
+        visible.sort_by(|a, b| match list.sort_col {
+            Column::Name => a.name.cmp(&b.name),
+            Column::Status => a.status.cmp(&b.status),
+            Column::Age => b.created.cmp(&a.created), // newer = younger = "smaller" age
+        });
+        if !list.ascending {
+            visible.reverse();
+        }
+    }
+    visible
+}
+
 /// Items matching `query`, best fuzzy score first. Empty query keeps original order.
 fn filter<'a>(items: &'a [Item], query: &str, matcher: &SkimMatcherV2) -> Vec<&'a Item> {
     if query.is_empty() {
@@ -1402,17 +1452,24 @@ fn run_app(
     let mut cview: Option<(String, bool)> = None; // container pane: (name, is init)
     let mut env_sel = TableState::default(); // scroll position of the container's env table
     let mut logs: Option<log_view::LogView> = None; // log pane, when open
+    let mut generic: Option<generic_view::GenericView> = None; // list of any other resource type
+    let pods_info = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = notice; // result of the last action, cleared on next key
 
     let mut saved = state.clone(); // what the file holds right now
-    // Reopen where the last run stopped: the pod list of the remembered namespace (or of all).
-    if state.namespace.is_some() || state.all_namespaces {
-        match state.resource {
-            state::Resource::Pods => {
+    // Reopen where the last run stopped.
+    let remembered = state.resource.clone();
+    if state.open == state::Level::Resource && !remembered.version.is_empty() && !remembered.kind.is_empty() {
+        match remembered.target() {
+            resources::Target::Pods => {
                 pods = Some(open_pods(client, rt, &tx, &mut activity, state.namespace.clone()));
-                lists.push(ListView::sorted(state.sort.pods));
+                lists.push(ListView::sorted(state.sort.resource));
+            }
+            resources::Target::Namespaces => {}
+            resources::Target::Generic => {
+                generic = Some(open_generic(client, rt, &tx, &mut activity, remembered, state.namespace.clone(), state.sort.resource));
             }
         }
     }
@@ -1431,11 +1488,16 @@ fn run_app(
 
         // Mirror what is on screen into `state`; write the file only when something changed.
         state.sort.namespaces = state::Sort::of(&lists[0]);
-        if let Some(l) = lists.get(1) {
-            state.sort.pods = state::Sort::of(l);
+        if let Some(g) = &generic {
+            state.sort.resource = state::Sort::of(&g.list);
+            state.resource = g.info.clone();
+            state.namespace = g.scope.clone();
+        } else if let Some(p) = &pods {
+            state.sort.resource = state::Sort::of(&lists[1]);
+            state.resource = pods_info.clone();
+            state.namespace = p.scope.clone();
         }
-        state.namespace = pods.as_ref().and_then(|p| p.scope.clone());
-        state.all_namespaces = pods.as_ref().is_some_and(|p| p.scope.is_none());
+        state.open = if generic.is_some() || pods.is_some() { state::Level::Resource } else { state::Level::Namespaces };
         if state != saved {
             if let Some(path) = state_path {
                 if let Err(e) = state.save(path) {
@@ -1444,7 +1506,11 @@ fn run_app(
             }
             saved = state.clone(); // also after a failure, so it is not retried every frame
         }
-        let kind = if in_pods { "pod" } else { "namespace" };
+        let kind: String = match &generic {
+            Some(g) => g.info.kind.to_lowercase(),
+            None if in_pods => "pod".into(),
+            None => "namespace".into(),
+        };
 
         // Snapshot of the active level's informer cache; changes as watch events arrive.
         let items: Vec<Item> = match &pods {
@@ -1478,18 +1544,7 @@ fn run_app(
             _ => vec![],
         };
         let list = lists.last_mut().unwrap();
-        let mut visible = filter(&items, &list.query, &matcher);
-        // With a query, fuzzy rank wins; otherwise apply the chosen sort.
-        if list.query.is_empty() {
-            visible.sort_by(|a, b| match list.sort_col {
-                Column::Name => a.name.cmp(&b.name),
-                Column::Status => a.status.cmp(&b.status),
-                Column::Age => b.created.cmp(&a.created), // newer = younger = "smaller" age
-            });
-            if !list.ascending {
-                visible.reverse();
-            }
-        }
+        let visible = visible_items(&items, list, &matcher);
         let selected = list.table.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
 
         // Details are looked up live each frame; if the object vanished, go back to the list.
@@ -1520,7 +1575,11 @@ fn run_app(
             crumbs.push(p.scope.clone().unwrap_or_else(|| "All namespaces".into()));
             crumbs.push("Pods".into());
         }
-        let hints: Hints = if let Some(v) = &yaml {
+        let hints: Hints = if let Some(g) = &generic {
+            crumbs.truncate(1);
+            crumbs.extend(g.crumbs());
+            g.hints()
+        } else if let Some(v) = &yaml {
             crumbs.push(v.name());
             crumbs.push("YAML".into());
             YAML_HINTS
@@ -1558,6 +1617,8 @@ fn run_app(
                 v.render(frame, body, &status);
             } else if let Some(l) = &mut logs {
                 l.render(frame, body, &status);
+            } else if let Some(g) = &mut generic {
+                g.render(frame, body, &status);
             } else if let Some(cd) = &cdetails {
                 container_view::render(frame, body, cd, samples.as_deref(), &mut env_sel, &status);
             } else if let Some(d) = &details {
@@ -1596,7 +1657,12 @@ fn run_app(
                 Modal::Delete { name, kind, yes } => match key.code {
                     code if code == KeyCode::Char('y') || (code == KeyCode::Enter && yes) => {
                         let label = format!("deleting {name}");
+                        let real = name.rsplit('/').next().unwrap_or(&name).to_string(); // key -> real name
                         match &pods {
+                            _ if generic.is_some() => {
+                                let api = generic.as_ref().unwrap().api_for(&name);
+                                spawn_op(rt, &tx, &mut activity, label, async move { delete_obj(&api, &real).await });
+                            }
                             Some(p) => {
                                 let api = p.api_for(&name);
                                 let name = name.rsplit('/').next().unwrap_or(&name).to_string(); // key -> real name
@@ -1631,7 +1697,7 @@ fn run_app(
                                     activity.finish(old.loading); // dropping `old` aborts its watchers
                                 }
                                 pods = Some(open_pods(client, rt, &tx, &mut activity, scope));
-                                *lists.last_mut().unwrap() = ListView::sorted(state.sort.pods);
+                                *lists.last_mut().unwrap() = ListView::sorted(state.sort.resource);
                                 viewing = None;
                             }
                             None
@@ -1658,21 +1724,34 @@ fn run_app(
                         KeyCode::Enter => {
                             match res_matches.get(sel) {
                                 None => message = format!("no resource type matches \"{query}\""),
-                                Some(r) => match r.target() {
-                                    Some(resources::Target::Pods) if pods.is_none() => {
-                                        // from the namespace list: the pods of the highlighted namespace
-                                        pods = Some(open_pods(client, rt, &tx, &mut activity, selected.clone()));
-                                        lists.push(ListView::sorted(state.sort.pods));
+                                Some(r) => {
+                                    // namespace to keep: the open list's, else the highlighted namespace
+                                    let scope = generic
+                                        .as_ref()
+                                        .map(|g| g.scope.clone())
+                                        .or_else(|| pods.as_ref().map(|p| p.scope.clone()))
+                                        .unwrap_or_else(|| selected.clone());
+                                    if let Some(old) = generic.take() {
+                                        activity.finish(old.loading);
                                     }
-                                    Some(resources::Target::Namespaces) if pods.is_some() => {
-                                        if let Some(p) = pods.take() {
-                                            activity.finish(p.loading);
+                                    match r.target() {
+                                        resources::Target::Pods => {
+                                            if pods.is_none() {
+                                                pods = Some(open_pods(client, rt, &tx, &mut activity, scope));
+                                                lists.push(ListView::sorted(state.sort.resource));
+                                            }
                                         }
-                                        lists.pop();
+                                        resources::Target::Namespaces => {
+                                            if let Some(p) = pods.take() {
+                                                activity.finish(p.loading);
+                                                lists.pop();
+                                            }
+                                        }
+                                        resources::Target::Generic => {
+                                            generic = Some(open_generic(client, rt, &tx, &mut activity, r.clone(), scope, state.sort.resource));
+                                        }
                                     }
-                                    Some(_) => {} // already there
-                                    None => message = format!("{} is not supported yet", r.name),
-                                },
+                                }
                             }
                             None
                         }
@@ -1745,6 +1824,32 @@ fn run_app(
             }
             continue;
         }
+        if generic.is_some() {
+            let action = generic.as_mut().and_then(|g| g.handle_key(key));
+            match action {
+                None => {}
+                Some(generic_view::Action::Close) => {
+                    if let Some(g) = generic.take() {
+                        activity.finish(g.loading);
+                    }
+                }
+                Some(generic_view::Action::Quit) => return Ok(()),
+                Some(generic_view::Action::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                Some(generic_view::Action::Copy(text)) => {
+                    message = match copy(&mut clipboard, &text) {
+                        Ok(()) => format!("copied {} lines", text.lines().count()),
+                        Err(e) => format!("copy failed: {e:#}"),
+                    };
+                }
+                Some(generic_view::Action::Delete(name)) => modal = Some(Modal::Delete { name, kind: kind.clone(), yes: false }),
+                Some(generic_view::Action::Edit(name)) => {
+                    if let Some(g) = &generic {
+                        edit_flow(terminal, rt, &tx, &mut activity, &g.api_for(&name), g.store(), &name, &mut message);
+                    }
+                }
+            }
+            continue;
+        }
         let mut logs_target: Option<(String, Option<String>)> = None; // (pod, only this container)
         let mut edit_target: Option<String> = None;
         let mut yaml_target: Option<String> = None;
@@ -1781,7 +1886,7 @@ fn run_app(
                     }
                 }
                 KeyCode::Char('d') if ctrl => {
-                    modal = viewing.clone().map(|name| Modal::Delete { name, kind, yes: false });
+                    modal = viewing.clone().map(|name| Modal::Delete { name, kind: kind.clone(), yes: false });
                 }
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
@@ -1810,7 +1915,7 @@ fn run_app(
         } else {
             match key.code {
                 KeyCode::Char('d') if ctrl => {
-                    modal = selected.clone().map(|name| Modal::Delete { name, kind, yes: false });
+                    modal = selected.clone().map(|name| Modal::Delete { name, kind: kind.clone(), yes: false });
                 }
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
                 KeyCode::Char('n') if ctrl => {
@@ -1865,7 +1970,7 @@ fn run_app(
         }
         if let Some(ns) = enter_pods {
             pods = Some(open_pods(client, rt, &tx, &mut activity, Some(ns)));
-            lists.push(ListView::sorted(state.sort.pods));
+            lists.push(ListView::sorted(state.sort.resource));
         }
         if let Some(name) = yaml_target {
             let value = match &pods {

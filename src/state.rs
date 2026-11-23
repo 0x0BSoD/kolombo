@@ -1,14 +1,16 @@
 //! Choices remembered between runs, in `$HOME/.config/kolombo/state` (YAML).
 
-use crate::{Column, ListView};
+use crate::{Column, ListView, resources::{self, ResourceInfo}};
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::{Path, PathBuf}};
 
+/// Which list was on screen.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum Resource {
+pub enum Level {
     #[default]
-    Pods,
+    Namespaces,
+    Resource,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -33,20 +35,30 @@ impl Sort {
 #[serde(default)]
 pub struct Sorts {
     pub namespaces: Sort,
-    pub pods: Sort,
+    /// Order of whichever resource list is open (pods, services, a CRD...).
+    #[serde(alias = "pods")]
+    pub resource: Sort,
 }
 
 /// `#[serde(default)]` fills any missing field, so an old or hand-edited file still loads.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct State {
-    /// What the list level below the namespaces shows.
-    pub resource: Resource,
-    /// Namespace whose `resource` list was open; absent = the namespace list was open.
+    /// The list that was open: the namespaces, or `resource`.
+    pub open: Level,
+    /// The resource type of the list below the namespaces, as API discovery described it:
+    /// enough to open it again without asking the cluster (group/version/kind/name/scope).
+    pub resource: ResourceInfo,
+    /// Namespace the resource list was limited to; absent = all namespaces (or a cluster-scoped type).
     pub namespace: Option<String>,
-    /// The all-namespaces list was open (a namespace could be called anything, so not a magic name).
-    pub all_namespaces: bool,
     pub sort: Sorts,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let pods = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
+        Self { open: Level::default(), resource: pods, namespace: None, sort: Sorts::default() }
+    }
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -88,6 +100,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn published_schema_describes_the_resource_for_reopening() {
+        let mut state = State::default();
+        state.open = Level::Resource;
+        state.resource = ResourceInfo {
+            name: "widgets".into(),
+            kind: "Widget".into(),
+            group: "example.com".into(),
+            version: "v1alpha1".into(),
+            namespaced: true,
+            ..Default::default()
+        };
+        state.namespace = Some("team-a".into());
+        let yaml = serde_yaml_ng::to_string(&state).unwrap();
+        println!("{yaml}");
+        for want in ["open: resource", "group: example.com", "version: v1alpha1", "kind: Widget", "name: widgets", "namespace: team-a"] {
+            assert!(yaml.contains(want), "missing {want}");
+        }
+        assert_eq!(serde_yaml_ng::from_str::<State>(&yaml).unwrap(), state);
+    }
+
+    #[test]
     fn creates_missing_file_and_round_trips() {
         let dir = std::env::temp_dir().join(format!("kolombo-state-test-{}", std::process::id()));
         let path = dir.join("nested/state");
@@ -96,15 +129,19 @@ mod tests {
 
         let saved = State {
             namespace: Some("kube-system".into()),
-            sort: Sorts { pods: Sort { column: Column::Age, ascending: false }, ..Default::default() },
+            open: Level::Resource,
+            sort: Sorts { resource: Sort { column: Column::Age, ascending: false }, ..Default::default() },
             ..Default::default()
         };
         saved.save(&path).unwrap();
         assert_eq!(State::load(Some(&path)).0, saved);
 
         // a partial or damaged file never stops the app from starting
-        fs::write(&path, "namespace: x\n").unwrap();
-        assert_eq!(State::load(Some(&path)).0.namespace.as_deref(), Some("x"));
+        fs::write(&path, "namespace: x\nsort:\n  pods: { column: age, ascending: false }\n").unwrap();
+        let (old, _) = State::load(Some(&path));
+        assert_eq!(old.namespace.as_deref(), Some("x"));
+        assert_eq!(old.sort.resource.column, Column::Age); // `pods:` is the old name of `resource:`
+        assert_eq!(old.resource.name, "pods");
         fs::write(&path, "sort: [oops").unwrap();
         let (fallback, warning) = State::load(Some(&path));
         assert_eq!(fallback, State::default());

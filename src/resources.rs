@@ -3,8 +3,10 @@
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResourceList;
 use kube::Client;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ResourceInfo {
     pub name: String, // plural, e.g. "pods"
     pub singular: String,
@@ -12,6 +14,7 @@ pub struct ResourceInfo {
     pub kind: String,
     pub group: String, // "" for the core group
     pub version: String,
+    pub namespaced: bool,
 }
 
 /// What the app can open today.
@@ -19,15 +22,20 @@ pub struct ResourceInfo {
 pub enum Target {
     Namespaces,
     Pods,
+    Generic, // any other type, through the untyped list
 }
 
 impl ResourceInfo {
-    pub fn target(&self) -> Option<Target> {
+    pub fn target(&self) -> Target {
         match (self.group.as_str(), self.name.as_str()) {
-            ("", "pods") => Some(Target::Pods),
-            ("", "namespaces") => Some(Target::Namespaces),
-            _ => None,
+            ("", "pods") => Target::Pods,
+            ("", "namespaces") => Target::Namespaces,
+            _ => Target::Generic,
         }
+    }
+
+    pub fn api_version(&self) -> String {
+        if self.group.is_empty() { self.version.clone() } else { format!("{}/{}", self.group, self.version) }
     }
 
     pub fn aliases(&self) -> String {
@@ -44,6 +52,7 @@ pub fn builtin() -> Vec<ResourceInfo> {
         kind: kind.into(),
         group: String::new(),
         version: "v1".into(),
+        namespaced: name == "pods",
     };
     vec![info("namespaces", "namespace", "ns", "Namespace"), info("pods", "pod", "po", "Pod")]
 }
@@ -63,6 +72,7 @@ fn collect(list: APIResourceList, out: &mut Vec<ResourceInfo>) {
             kind: r.kind,
             group: group.clone(),
             version: version.clone(),
+            namespaced: r.namespaced,
         });
     }
 }
@@ -130,6 +140,7 @@ mod tests {
             kind: kind.into(),
             group: group.into(),
             version: "v1".into(),
+            namespaced: true,
         }
     }
 
@@ -154,10 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn only_core_pods_and_namespaces_can_be_opened() {
+    fn core_pods_and_namespaces_are_typed_everything_else_is_generic() {
         let b = builtin();
-        assert_eq!(b[0].target(), Some(Target::Namespaces));
-        assert_eq!(b[1].target(), Some(Target::Pods));
-        assert_eq!(res("pods", "", &[], "PodMetrics", "metrics.k8s.io").target(), None);
+        assert_eq!(b[0].target(), Target::Namespaces);
+        assert_eq!(b[1].target(), Target::Pods);
+        assert_eq!(res("pods", "", &[], "PodMetrics", "metrics.k8s.io").target(), Target::Generic);
+        assert_eq!(res("widgets", "", &[], "Widget", "example.com").api_version(), "example.com/v1");
     }
 }
