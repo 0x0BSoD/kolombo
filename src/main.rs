@@ -6,14 +6,15 @@ use kube::{
     runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
 };
 use ratatui::{
-    DefaultTerminal,
+    DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode},
-    layout::Constraint,
+    layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
 };
 use std::{
+    collections::BTreeMap,
     hash::{DefaultHasher, Hash, Hasher},
     time::Duration,
 };
@@ -34,6 +35,66 @@ fn is_system_label(key: &str) -> bool {
 /// True for the plain label key `name` (it just repeats the namespace name).
 fn is_name_label(key: &str) -> bool {
     key == "name"
+}
+
+/// Key/value table for a labels/annotations map, with a count in the title.
+fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>) -> Table<'a> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut rows: Vec<Row> = map
+        .iter()
+        .flatten()
+        .map(|(k, v)| Row::new([Cell::from(k.as_str()).style(Style::new().fg(Color::Cyan)), Cell::from(v.as_str())]))
+        .collect();
+    let count = rows.len();
+    if rows.is_empty() {
+        rows.push(Row::new([Cell::from("<none>").style(dim)]));
+    }
+    Table::new(rows, [Constraint::Percentage(40), Constraint::Fill(1)])
+        .header(Row::new(["KEY", "VALUE"]).style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow)))
+        .block(Block::bordered().border_style(dim).title(format!(" {title} ({count}) ")))
+}
+
+/// Fullscreen details: breadcrumb frame, info block, labels table, annotations table.
+fn render_details(frame: &mut Frame, ns: &Namespace) {
+    let m = &ns.metadata;
+    let name = m.name.clone().unwrap_or_default();
+    let phase = ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+    let phase_color = if phase == "Active" { Color::Green } else { Color::Yellow };
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    let created = m.creation_timestamp.as_ref().map_or(String::new(), |t| {
+        format!("{} ({} ago)", t.0, format_age(jiff::Timestamp::now().as_second() - t.0.as_second()))
+    });
+
+    // Breadcrumb: Namespaces // <name> // Details
+    let crumbs = Line::from(vec![
+        Span::styled(" Namespaces ", dim),
+        Span::styled("// ", dim),
+        Span::styled(name.clone(), bold.fg(Color::Cyan)),
+        Span::styled(" // ", dim),
+        Span::styled("Details ", bold),
+        Span::styled("(Esc back) ", dim),
+    ]);
+    let outer = Block::bordered().title(crumbs);
+    let inner = outer.inner(frame.area());
+    frame.render_widget(outer, frame.area());
+
+    let [info, labels, annotations] =
+        Layout::vertical([Constraint::Length(6), Constraint::Fill(1), Constraint::Fill(1)]).areas(inner);
+
+    let field = |k: &str, v: Span<'static>| Line::from(vec![Span::styled(format!("{k:<10}"), dim), v]);
+    let lines = vec![
+        field("Name", Span::styled(name, bold)),
+        field("Status", Span::styled(format!("● {phase}"), Style::new().fg(phase_color))),
+        field("Created", Span::raw(created)),
+        field("UID", Span::raw(m.uid.clone().unwrap_or_default())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().border_style(dim).title(" Info ")),
+        info,
+    );
+    frame.render_widget(map_table("Labels", &m.labels), labels);
+    frame.render_widget(map_table("Annotations", &m.annotations), annotations);
 }
 
 /// One padded, colored "pill". Same text always gets the same color.
@@ -127,6 +188,7 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
     let mut typing = false; // true while the search popup is open
     let mut sort_col = Column::Name;
     let mut ascending = true;
+    let mut viewing: Option<String> = None; // namespace shown in the details view
 
     loop {
         // Snapshot of the informer cache; changes as watch events arrive.
@@ -161,7 +223,23 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
             }
         }
 
+        // Details are looked up live each frame; if the namespace vanished, go back to the list.
+        let details = viewing.as_ref().and_then(|n| {
+            store
+                .state()
+                .iter()
+                .find(|ns| ns.metadata.name.as_ref() == Some(n))
+                .cloned()
+        });
+        if details.is_none() {
+            viewing = None;
+        }
+
         terminal.draw(|frame| {
+            if let Some(ns) = &details {
+                render_details(frame, ns);
+                return;
+            }
             let title = format!(" Namespaces {}/{} (/ search, q quit) ", visible.len(), names.len());
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
@@ -221,7 +299,11 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
         }
         let Event::Key(key) = event::read()? else { continue };
 
-        if typing {
+        if viewing.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'd')) {
+                viewing = None;
+            }
+        } else if typing {
             match key.code {
                 KeyCode::Char(c) => {
                     query.push(c);
@@ -244,6 +326,9 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
                 KeyCode::Char('>') => sort_col = sort_col.step(1),
                 KeyCode::Char('<') => sort_col = sort_col.step(-1),
                 KeyCode::Char('A') => ascending = !ascending,
+                KeyCode::Char('d') => {
+                    viewing = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
+                }
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc if query.is_empty() => return Ok(()),
                 KeyCode::Esc => query.clear(), // first Esc drops the filter
