@@ -594,6 +594,7 @@ const LOG_HINTS: Hints = &[
     ("1/2/3/0", "1m/5m/15m/all"),
     ("s", "autoscroll"),
     ("w", "wrap"),
+    ("f", "fullscreen"),
     ("j/k", "scroll"),
     ("g/G", "top/end"),
     ("h/l", "pan"),
@@ -1352,6 +1353,13 @@ fn run_app(
         terminal.draw(|frame| {
             let [head, body] =
                 Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Fill(1)]).areas(frame.area());
+            if logs.as_ref().is_some_and(|l| l.is_full()) {
+                // Bare text over the whole screen, so a terminal selection copies only log text.
+                if let Some(l) = &mut logs {
+                    l.render(frame, frame.area(), &status);
+                }
+                return;
+            }
             render_header(frame, head, info, &crumbs);
             if let Some(v) = &mut yaml {
                 v.render(frame, body, &status);

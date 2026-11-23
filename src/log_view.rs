@@ -118,6 +118,7 @@ pub struct LogView {
     range: Range,
     follow: bool, // "autoscroll"
     wrap: bool,
+    full: bool, // bare text over the whole screen, for copy-paste
     top: usize,     // first shown line while not following
     hscroll: usize, // columns skipped when not wrapping
     height: usize,  // body rows, learned at render time
@@ -143,6 +144,7 @@ impl LogView {
             range: Range::Minutes(1),
             follow: true,
             wrap: false,
+            full: false,
             top: 0,
             hscroll: 0,
             height: 1,
@@ -176,6 +178,10 @@ impl LogView {
         self.start();
     }
 
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
     pub fn pod(&self) -> &str {
         &self.pod
     }
@@ -197,6 +203,8 @@ impl LogView {
             KeyCode::Char('3') => self.set_range(Range::Minutes(15)),
             KeyCode::Char('0') => self.set_range(Range::All),
             KeyCode::Char('s') => self.follow = !self.follow,
+            KeyCode::Char('f') => self.full = !self.full,
+            KeyCode::Esc if self.full => self.full = false,
             KeyCode::Char('w') => {
                 self.wrap = !self.wrap;
                 self.hscroll = 0;
@@ -218,10 +226,12 @@ impl LogView {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, message: &str) {
-        self.height = area.height.saturating_sub(2).max(1) as usize;
+        let border = if self.full { 0 } else { 2 };
+        self.height = area.height.saturating_sub(border).max(1) as usize;
         let multi = self.containers.len() > 1;
         let name_w = if multi { self.containers.iter().map(|c| c.chars().count()).max().unwrap_or(0) } else { 0 };
-        let fmt = Fmt { wrap: self.wrap, hscroll: self.hscroll, width: area.width.saturating_sub(2) as usize, multi, name_w };
+        let (border, bare) = if self.full { (0, true) } else { (2, false) };
+        let fmt = Fmt { wrap: self.wrap, hscroll: self.hscroll, width: area.width.saturating_sub(border) as usize, multi, name_w, bare };
 
         let buf = self.shared.lock().unwrap();
         let n = buf.lines.len();
@@ -250,6 +260,10 @@ impl LogView {
         };
         drop(buf);
 
+        if self.full {
+            frame.render_widget(Paragraph::new(rows), area);
+            return;
+        }
         let dim = Style::new().fg(Color::DarkGray);
         let on = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
         let choice = |label: &str, range: Range| Span::styled(format!(" {label} "), if self.range == range { on.add_modifier(Modifier::REVERSED) } else { dim });
@@ -279,18 +293,22 @@ struct Fmt {
     width: usize,
     multi: bool,
     name_w: usize,
+    bare: bool, // no clock, no container name
 }
 
 impl Fmt {
     fn prefix_width(&self) -> usize {
+        if self.bare {
+            return 0;
+        }
         9 + if self.multi { self.name_w + 1 } else { 0 }
     }
 
     fn rows(&self, l: &LogLine, names: &[String]) -> Vec<Line<'static>> {
         let dim = Style::new().fg(Color::DarkGray);
         let text = clean(&l.text);
-        let mut head = vec![Span::styled(format!("{} ", l.clock), dim)];
-        if self.multi {
+        let mut head = if self.bare { vec![] } else { vec![Span::styled(format!("{} ", l.clock), dim)] };
+        if self.multi && !self.bare {
             let color = PALETTE[l.container % PALETTE.len()];
             head.push(Span::styled(format!("{:<w$} ", names[l.container], w = self.name_w), Style::new().fg(color)));
         }
@@ -384,11 +402,14 @@ mod tests {
     fn wrap_continues_under_the_text_and_names_show_for_many_containers() {
         let line = parse(1, "2026-11-23T10:00:00Z 0123456789abcdefghij");
         let names = vec!["web".to_string(), "sidecar".to_string()];
-        let f = Fmt { wrap: true, hscroll: 0, width: 9 + 8 + 10, multi: true, name_w: 7 };
+        let f = Fmt { wrap: true, hscroll: 0, width: 9 + 8 + 10, multi: true, name_w: 7, bare: false };
         let rows = f.rows(&line, &names);
         let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
         assert_eq!(rows.len(), 2);
         assert_eq!(text(&rows[0]), "10:00:00 sidecar 0123456789");
         assert_eq!(text(&rows[1]), "                 abcdefghij");
+
+        let bare = Fmt { bare: true, width: 10, ..f };
+        assert_eq!(bare.rows(&line, &names).iter().map(text).collect::<Vec<_>>(), ["0123456789", "abcdefghij"]);
     }
 }
