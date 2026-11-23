@@ -1,3 +1,5 @@
+mod yaml_view;
+
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use k8s_openapi::{api::core::v1::Namespace, jiff};
 use futures::StreamExt;
@@ -14,6 +16,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
 };
+use yaml_view::{Outcome, YamlView};
 use std::{
     collections::BTreeMap,
     hash::{DefaultHasher, Hash, Hasher},
@@ -162,6 +165,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Put text on the system clipboard. The handle is kept so X11 can still serve the paste.
+fn copy(clipboard: &mut Option<arboard::Clipboard>, text: &str) -> anyhow::Result<()> {
+    if clipboard.is_none() {
+        *clipboard = Some(arboard::Clipboard::new()?);
+    }
+    clipboard.as_mut().unwrap().set_text(text)?;
+    Ok(())
+}
+
 /// Open the namespace as YAML in $EDITOR; if changed, send it to the cluster.
 /// Returns a one-line message for the UI.
 fn edit_ns(
@@ -234,6 +246,8 @@ fn run_app(
     let mut sort_col = Column::Name;
     let mut ascending = true;
     let mut viewing: Option<String> = None; // namespace shown in the details view
+    let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
+    let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = String::new(); // result of the last action, cleared on next key
 
     loop {
@@ -282,11 +296,15 @@ fn run_app(
         }
 
         terminal.draw(|frame| {
+            if let Some(v) = &mut yaml {
+                v.render(frame, &message);
+                return;
+            }
             if let Some(ns) = &details {
                 render_details(frame, ns, &message);
                 return;
             }
-            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, q quit) ", visible.len(), names.len());
+            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, y yaml, q quit) ", visible.len(), names.len());
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
                 .iter()
@@ -346,11 +364,26 @@ fn run_app(
         let Event::Key(key) = event::read()? else { continue };
 
         message.clear();
+        if let Some(v) = &mut yaml {
+            match v.handle_key(key) {
+                Some(Outcome::Close) => yaml = None,
+                Some(Outcome::Copy(text)) => {
+                    message = match copy(&mut clipboard, &text) {
+                        Ok(()) => format!("copied {} lines", text.lines().count()),
+                        Err(e) => format!("copy failed: {e:#}"),
+                    };
+                }
+                None => {}
+            }
+            continue;
+        }
         let mut edit_target: Option<String> = None;
+        let mut yaml_target: Option<String> = None;
         if viewing.is_some() {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
                 KeyCode::Char('e') => edit_target = viewing.clone(),
+                KeyCode::Char('y') => yaml_target = viewing.clone(),
                 _ => {}
             }
         } else if typing {
@@ -379,6 +412,9 @@ fn run_app(
                 KeyCode::Char('d') => {
                     viewing = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
                 }
+                KeyCode::Char('y') => {
+                    yaml_target = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
+                }
                 KeyCode::Char('e') => {
                     edit_target = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
                 }
@@ -391,6 +427,10 @@ fn run_app(
             }
         }
 
+        if let Some(name) = yaml_target {
+            let ns = store.state().iter().find(|ns| ns.metadata.name.as_ref() == Some(&name)).cloned();
+            yaml = ns.map(|ns| YamlView::new((*ns).clone()));
+        }
         if let Some(name) = edit_target {
             let ns = store.state().iter().find(|ns| ns.metadata.name.as_ref() == Some(&name)).cloned();
             if let Some(ns) = ns {
