@@ -5,12 +5,12 @@ use k8s_openapi::{api::core::v1::Namespace, jiff};
 use futures::StreamExt;
 use kube::{
     Api, Client,
-    api::PostParams,
+    api::{DeleteParams, PostParams},
     runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
 };
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event, KeyCode},
+    crossterm::event::{self, Event, KeyCode, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -21,7 +21,8 @@ use std::{
     collections::BTreeMap,
     hash::{DefaultHasher, Hash, Hasher},
     process::Command,
-    time::Duration,
+    sync::mpsc::{self, Sender},
+    time::{Duration, Instant},
 };
 
 struct Ns {
@@ -165,6 +166,116 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A popup that grabs all keys until closed.
+enum Modal {
+    Delete { name: String, yes: bool }, // `yes` = which button is focused
+    New(String),                        // name typed so far
+}
+
+fn render_modal(frame: &mut Frame, modal: &Modal) {
+    match modal {
+        Modal::Delete { name, yes } => {
+            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(5));
+            frame.render_widget(Clear, area);
+            let button = |label: &str, focused: bool| {
+                let style = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                Span::styled(format!(" {label} "), style)
+            };
+            let text = vec![
+                Line::from(format!("Delete namespace \"{name}\"?")),
+                Line::raw(""),
+                Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]),
+            ];
+            frame.render_widget(
+                Paragraph::new(text)
+                    .centered()
+                    .block(Block::bordered().border_style(Style::new().fg(Color::Red)).title(" Delete (y/n, Enter) ")),
+                area,
+            );
+        }
+        Modal::New(input) => {
+            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(input.as_str()).block(Block::bordered().title(" New namespace (Enter create, Esc cancel) ")),
+                area,
+            );
+            frame.set_cursor_position((area.x + 1 + input.chars().count() as u16, area.y + 1));
+        }
+    }
+}
+
+async fn delete_ns(api: &Api<Namespace>, name: &str) -> String {
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => format!("{name} deleted (terminating)"), // namespaces go Terminating first
+        Err(e) => format!("delete failed: {e}"),
+    }
+}
+
+async fn create_ns(api: &Api<Namespace>, name: &str) -> String {
+    let mut ns = Namespace::default();
+    ns.metadata.name = Some(name.to_string());
+    match api.create(&PostParams::default(), &ns).await {
+        Ok(_) => format!("{name} created"),
+        Err(e) => format!("create failed: {e}"),
+    }
+}
+
+async fn replace_ns(api: &Api<Namespace>, name: &str, ns: &Namespace) -> String {
+    match api.replace(name, &PostParams::default(), ns).await {
+        Ok(_) => format!("{name} updated"),
+        Err(e) => format!("update failed: {e}"),
+    }
+}
+
+/// A background operation finished. `id` matches the Activity entry.
+struct Done {
+    id: u64,
+    message: Option<String>,
+}
+
+/// Operations currently in flight; the newest label is shown in the corner.
+struct Activity {
+    items: Vec<(u64, String)>,
+    next: u64,
+}
+
+impl Activity {
+    fn start(&mut self, label: String) -> u64 {
+        self.next += 1;
+        self.items.push((self.next, label));
+        self.next
+    }
+
+    fn finish(&mut self, id: u64) {
+        self.items.retain(|(i, _)| *i != id);
+    }
+
+    /// "[=   ] deleting foo +1" while busy, else None. `tick` advances the animation.
+    fn status(&self, tick: usize) -> Option<String> {
+        const BAR: [&str; 6] = ["[=   ]", "[ =  ]", "[  = ]", "[   =]", "[  = ]", "[ =  ]"];
+        let (_, label) = self.items.last()?;
+        let more = if self.items.len() > 1 { format!(" +{}", self.items.len() - 1) } else { String::new() };
+        Some(format!("{} {label}{more}", BAR[tick % BAR.len()]))
+    }
+}
+
+/// Run `fut` on the tokio runtime; the TUI loop hears about the result through `tx`.
+fn spawn_op(
+    rt: &tokio::runtime::Handle,
+    tx: &Sender<Done>,
+    activity: &mut Activity,
+    label: String,
+    fut: impl Future<Output = String> + Send + 'static,
+) {
+    let id = activity.start(label);
+    let tx = tx.clone();
+    rt.spawn(async move {
+        let message = fut.await;
+        let _ = tx.send(Done { id, message: Some(message) });
+    });
+}
+
 /// Put text on the system clipboard. The handle is kept so X11 can still serve the paste.
 fn copy(clipboard: &mut Option<arboard::Clipboard>, text: &str) -> anyhow::Result<()> {
     if clipboard.is_none() {
@@ -174,14 +285,9 @@ fn copy(clipboard: &mut Option<arboard::Clipboard>, text: &str) -> anyhow::Resul
     Ok(())
 }
 
-/// Open the namespace as YAML in $EDITOR; if changed, send it to the cluster.
-/// Returns a one-line message for the UI.
-fn edit_ns(
-    terminal: &mut DefaultTerminal,
-    rt: &tokio::runtime::Handle,
-    api: &Api<Namespace>,
-    ns: &Namespace,
-) -> anyhow::Result<String> {
+/// Open the namespace as YAML in $EDITOR and parse the result.
+/// Returns the edited object, or None when nothing changed.
+fn edit_ns(terminal: &mut DefaultTerminal, ns: &Namespace) -> anyhow::Result<Option<(String, Namespace)>> {
     let name = ns.metadata.name.clone().unwrap_or_default();
     let mut obj = ns.clone();
     obj.metadata.managed_fields = None; // noise, kubectl hides it too
@@ -203,11 +309,9 @@ fn edit_ns(
     }
     let after = after?;
     if after == before {
-        return Ok("no changes".into());
+        return Ok(None);
     }
-    let edited: Namespace = serde_yaml_ng::from_str(&after)?;
-    rt.block_on(api.replace(&name, &PostParams::default(), &edited))?;
-    Ok(format!("{name} updated"))
+    Ok(Some((name, serde_yaml_ng::from_str(&after)?)))
 }
 
 /// Names matching `query`, best fuzzy score first. Empty query keeps original order.
@@ -246,11 +350,32 @@ fn run_app(
     let mut sort_col = Column::Name;
     let mut ascending = true;
     let mut viewing: Option<String> = None; // namespace shown in the details view
+    let (tx, rx) = mpsc::channel::<Done>();
+    let mut activity = Activity { items: vec![(0, "loading namespaces".into())], next: 0 };
+    {
+        // id 0: the informer's first full list has arrived
+        let (store, tx) = (store.clone(), tx.clone());
+        rt.spawn(async move {
+            let _ = store.wait_until_ready().await;
+            let _ = tx.send(Done { id: 0, message: None });
+        });
+    }
+    let started = Instant::now();
+    let mut modal: Option<Modal> = None; // delete/new popup, when open
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = String::new(); // result of the last action, cleared on next key
 
     loop {
+        while let Ok(done) = rx.try_recv() {
+            activity.finish(done.id);
+            if let Some(m) = done.message {
+                message = m;
+            }
+        }
+        // Busy status wins over the last message; tick moves every 120ms.
+        let tick = (started.elapsed().as_millis() / 120) as usize;
+        let status = activity.status(tick).unwrap_or_else(|| message.clone());
         // Snapshot of the informer cache; changes as watch events arrive.
         let names: Vec<Ns> = store
             .state()
@@ -297,14 +422,17 @@ fn run_app(
 
         terminal.draw(|frame| {
             if let Some(v) = &mut yaml {
-                v.render(frame, &message);
+                v.render(frame, &status);
                 return;
             }
             if let Some(ns) = &details {
-                render_details(frame, ns, &message);
+                render_details(frame, ns, &status);
+                if let Some(m) = &modal {
+                    render_modal(frame, m);
+                }
                 return;
             }
-            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, y yaml, q quit) ", visible.len(), names.len());
+            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, y yaml, ^n new, ^d delete, q quit) ", visible.len(), names.len());
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
                 .iter()
@@ -340,10 +468,13 @@ fn run_app(
                     .chain(["LABELS".to_string()]))
                     .style(Style::new().add_modifier(Modifier::BOLD)),
                 )
-                .block(Block::bordered().title(title).title_bottom(format!(" {message} ")))
+                .block(Block::bordered().title(title).title_bottom(format!(" {status} ")))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             frame.render_stateful_widget(table, frame.area(), &mut state);
 
+            if let Some(m) = &modal {
+                render_modal(frame, m);
+            }
             if typing {
                 // Floating box: 50% wide, 3 rows tall, centered.
                 let popup = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
@@ -358,12 +489,52 @@ fn run_app(
         })?;
 
         // Wait up to 250ms for a key; on timeout loop again so the UI redraws with fresh data.
-        if !event::poll(Duration::from_millis(250))? {
+        let wait = if activity.items.is_empty() { 250 } else { 80 }; // redraw faster while animating
+        if !event::poll(Duration::from_millis(wait))? {
             continue;
         }
         let Event::Key(key) = event::read()? else { continue };
 
         message.clear();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(m) = modal.take() {
+            // take() empties `modal`; we put a popup back only if it stays open.
+            modal = match m {
+                Modal::Delete { name, yes } => match key.code {
+                    code if code == KeyCode::Char('y') || (code == KeyCode::Enter && yes) => {
+                        let api = api.clone();
+                        let label = format!("deleting {name}");
+                        spawn_op(rt, &tx, &mut activity, label, async move { delete_ns(&api, &name).await });
+                        viewing = None;
+                        None
+                    }
+                    KeyCode::Char('n') | KeyCode::Enter | KeyCode::Esc => None,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
+                        Some(Modal::Delete { name, yes: !yes })
+                    }
+                    _ => Some(Modal::Delete { name, yes }),
+                },
+                Modal::New(mut input) => match key.code {
+                    KeyCode::Enter if !input.is_empty() => {
+                        let api = api.clone();
+                        let label = format!("creating {input}");
+                        spawn_op(rt, &tx, &mut activity, label, async move { create_ns(&api, &input).await });
+                        None
+                    }
+                    KeyCode::Esc => None,
+                    KeyCode::Char(c) if !ctrl => {
+                        input.push(c);
+                        Some(Modal::New(input))
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        Some(Modal::New(input))
+                    }
+                    _ => Some(Modal::New(input)),
+                },
+            };
+            continue;
+        }
         if let Some(v) = &mut yaml {
             match v.handle_key(key) {
                 Some(Outcome::Close) => yaml = None,
@@ -381,6 +552,10 @@ fn run_app(
         let mut yaml_target: Option<String> = None;
         if viewing.is_some() {
             match key.code {
+                KeyCode::Char('d') if ctrl => {
+                    modal = viewing.clone().map(|name| Modal::Delete { name, yes: false });
+                }
+                KeyCode::Char('n') if ctrl => modal = Some(Modal::New(String::new())),
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
                 KeyCode::Char('e') => edit_target = viewing.clone(),
                 KeyCode::Char('y') => yaml_target = viewing.clone(),
@@ -388,7 +563,7 @@ fn run_app(
             }
         } else if typing {
             match key.code {
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !ctrl => {
                     query.push(c);
                     state.select_first();
                 }
@@ -405,6 +580,13 @@ fn run_app(
             }
         } else {
             match key.code {
+                KeyCode::Char('d') if ctrl => {
+                    modal = state
+                        .selected()
+                        .and_then(|i| visible.get(i))
+                        .map(|n| Modal::Delete { name: n.name.clone(), yes: false });
+                }
+                KeyCode::Char('n') if ctrl => modal = Some(Modal::New(String::new())),
                 KeyCode::Char('/') => typing = true,
                 KeyCode::Char('>') => sort_col = sort_col.step(1),
                 KeyCode::Char('<') => sort_col = sort_col.step(-1),
@@ -434,10 +616,15 @@ fn run_app(
         if let Some(name) = edit_target {
             let ns = store.state().iter().find(|ns| ns.metadata.name.as_ref() == Some(&name)).cloned();
             if let Some(ns) = ns {
-                message = match edit_ns(terminal, rt, api, &ns) {
-                    Ok(m) => m,
-                    Err(e) => format!("edit failed: {e:#}"),
-                };
+                match edit_ns(terminal, &ns) {
+                    Ok(Some((name, edited))) => {
+                        let api = api.clone();
+                        let label = format!("updating {name}");
+                        spawn_op(rt, &tx, &mut activity, label, async move { replace_ns(&api, &name, &edited).await });
+                    }
+                    Ok(None) => message = "no changes".into(),
+                    Err(e) => message = format!("edit failed: {e:#}"),
+                }
             }
         }
     }
