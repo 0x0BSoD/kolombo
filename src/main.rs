@@ -15,6 +15,31 @@ struct Ns {
     created: i64, // unix seconds
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Column {
+    Name,
+    Status,
+    Age,
+}
+
+impl Column {
+    const ALL: [Column; 3] = [Column::Name, Column::Status, Column::Age];
+
+    fn title(self) -> &'static str {
+        match self {
+            Column::Name => "NAME",
+            Column::Status => "STATUS",
+            Column::Age => "AGE",
+        }
+    }
+
+    /// Step through ALL with wrap-around. `delta` is +1 or -1.
+    fn step(self, delta: isize) -> Column {
+        let i = Column::ALL.iter().position(|&c| c == self).unwrap() as isize;
+        Column::ALL[(i + delta).rem_euclid(Column::ALL.len() as isize) as usize]
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Fetch before entering the TUI so errors print on a normal terminal.
@@ -64,9 +89,22 @@ fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> 
     let mut state = TableState::default().with_selected(Some(0));
     let mut query = String::new();
     let mut typing = false; // true while the search popup is open
+    let mut sort_col = Column::Name;
+    let mut ascending = true;
 
     loop {
-        let visible = filter(names, &query, &matcher);
+        let mut visible = filter(names, &query, &matcher);
+        // With a query, fuzzy rank wins; otherwise apply the chosen sort.
+        if query.is_empty() {
+            visible.sort_by(|a, b| match sort_col {
+                Column::Name => a.name.cmp(&b.name),
+                Column::Status => a.phase.cmp(&b.phase),
+                Column::Age => b.created.cmp(&a.created), // newer = younger = "smaller" age
+            });
+            if !ascending {
+                visible.reverse();
+            }
+        }
 
         terminal.draw(|frame| {
             let title = format!(" Namespaces {}/{} (/ search, q quit) ", visible.len(), names.len());
@@ -76,7 +114,16 @@ fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> 
                 .map(|n| Row::new([n.name.clone(), n.phase.clone(), format_age(now - n.created)]));
             let widths = [Constraint::Fill(1), Constraint::Length(12), Constraint::Length(6)];
             let table = Table::new(rows, widths)
-                .header(Row::new(["NAME", "STATUS", "AGE"]).style(Style::new().add_modifier(Modifier::BOLD)))
+                .header(
+                    Row::new(Column::ALL.map(|c| {
+                        if c == sort_col && query.is_empty() {
+                            format!("{} {}", c.title(), if ascending { "▲" } else { "▼" })
+                        } else {
+                            c.title().to_string()
+                        }
+                    }))
+                    .style(Style::new().add_modifier(Modifier::BOLD)),
+                )
                 .block(Block::bordered().title(title))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             frame.render_stateful_widget(table, frame.area(), &mut state);
@@ -116,6 +163,9 @@ fn run_app(terminal: &mut DefaultTerminal, names: &[Ns]) -> std::io::Result<()> 
         } else {
             match key.code {
                 KeyCode::Char('/') => typing = true,
+                KeyCode::Char('>') => sort_col = sort_col.step(1),
+                KeyCode::Char('<') => sort_col = sort_col.step(-1),
+                KeyCode::Char('A') => ascending = !ascending,
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc if query.is_empty() => return Ok(()),
                 KeyCode::Esc => query.clear(), // first Esc drops the filter
