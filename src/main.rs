@@ -1,3 +1,4 @@
+mod container_view;
 mod yaml_view;
 
 use futures::StreamExt;
@@ -23,7 +24,7 @@ use ratatui::{
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
     process::Command,
@@ -278,9 +279,16 @@ struct MetricsState {
     usage: HashMap<String, Usage>,
 }
 
-/// Ask metrics-server (metrics.k8s.io) for every pod of a namespace.
+const POLL_SECS: u64 = 10;
+const HISTORY: usize = 60; // samples kept per container: 10 minutes at one per 10s
+
+/// Recent usage per (pod, container), oldest first. Kept apart from `MetricsState` because that
+/// is cloned every frame and this is not.
+type History = HashMap<(String, String), VecDeque<Usage>>;
+
+/// Ask metrics-server (metrics.k8s.io) for every pod of a namespace: pod -> usage per container.
 /// There are no typed structs for it in k8s-openapi, so read it as a dynamic object.
-async fn fetch_metrics(client: &Client, ns: &str) -> Result<HashMap<String, Usage>, kube::Error> {
+async fn fetch_metrics(client: &Client, ns: &str) -> Result<HashMap<String, Vec<(String, Usage)>>, kube::Error> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
     let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ApiResource::from_gvk_with_plural(&gvk, "pods"));
     let list = api.list(&ListParams::default()).await?;
@@ -288,13 +296,18 @@ async fn fetch_metrics(client: &Client, ns: &str) -> Result<HashMap<String, Usag
         .items
         .iter()
         .map(|o| {
-            let mut usage = Usage { cpu: 0, mem: 0 };
             // Indexing a serde_json Value with a missing key gives Null, so no unwraps needed.
-            for c in o.data["containers"].as_array().into_iter().flatten() {
-                usage.cpu += c["usage"]["cpu"].as_str().and_then(parse_cpu).unwrap_or(0);
-                usage.mem += c["usage"]["memory"].as_str().and_then(parse_mem).unwrap_or(0);
-            }
-            (o.name_any(), usage)
+            let containers = o.data["containers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| {
+                    let cpu = c["usage"]["cpu"].as_str().and_then(parse_cpu).unwrap_or(0);
+                    let mem = c["usage"]["memory"].as_str().and_then(parse_mem).unwrap_or(0);
+                    (c["name"].as_str().unwrap_or_default().to_string(), Usage { cpu, mem })
+                })
+                .collect();
+            (o.name_any(), containers)
         })
         .collect())
 }
@@ -316,6 +329,8 @@ struct Details {
 }
 
 struct ContainerRow {
+    raw_name: String, // without the init: prefix
+    init: bool,
     name: String,
     state: String,
     color: Color,
@@ -386,6 +401,8 @@ fn container_rows(pod: &Pod) -> Vec<ContainerRow> {
                 })
                 .unwrap_or_default();
             ContainerRow {
+                raw_name: c.name.clone(),
+                init: is_init,
                 name: if is_init { format!("init:{}", c.name) } else { c.name.clone() },
                 state,
                 color,
@@ -569,7 +586,8 @@ const POD_HINTS: Hints = &[
     ("q", "quit"),
 ];
 const DETAILS_HINTS: Hints = &[("e", "edit"), ("y", "yaml"), ("^n", "new"), ("^d", "delete"), ("Esc", "back")];
-const POD_DETAILS_HINTS: Hints = &[("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const POD_DETAILS_HINTS: Hints = &[("j/k", "select"), ("Enter", "container"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const CONTAINER_HINTS: Hints = &[("j/k", "scroll env"), ("y", "yaml"), ("Esc", "back")];
 const YAML_HINTS: Hints = &[
     ("j/k", "move"),
     ("g/G", "top/bottom"),
@@ -624,7 +642,7 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
 
 /// Details pane. Namespaces: info + labels + annotations. Pods: info and conditions on top,
 /// containers, events, and small labels/annotations tables at the bottom.
-fn render_details(frame: &mut Frame, area: Rect, d: &Details, message: &str) {
+fn render_details(frame: &mut Frame, area: Rect, d: &Details, sel: &mut TableState, message: &str) {
     let dim = Style::new().fg(Color::DarkGray);
     let head = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
     let outer = Block::bordered().title(" Details ").title_bottom(format!(" {message} "));
@@ -663,7 +681,7 @@ fn render_details(frame: &mut Frame, area: Rect, d: &Details, message: &str) {
         conds,
     );
 
-    let container_rows = x.containers.iter().map(|c| {
+    let container_rows: Vec<Row> = x.containers.iter().map(|c| {
         let ready = if c.ready { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
         Row::new([
             Cell::from(c.name.clone()),
@@ -673,15 +691,17 @@ fn render_details(frame: &mut Frame, area: Rect, d: &Details, message: &str) {
             Cell::from(c.last.clone()),
             Cell::from(c.image.clone()),
         ])
-    });
-    frame.render_widget(
+    }).collect();
+    frame.render_stateful_widget(
         Table::new(
             container_rows,
             [Constraint::Fill(2), Constraint::Length(24), Constraint::Length(5), Constraint::Length(8), Constraint::Fill(2), Constraint::Fill(3)],
         )
         .header(Row::new(["NAME", "STATE", "READY", "RESTARTS", "LAST STATE", "IMAGE"]).style(head))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .block(Block::bordered().border_style(dim).title(format!(" Containers ({}) ", x.containers.len()))),
         containers,
+        sel,
     );
 
     let mut event_rows: Vec<Row> = x
@@ -767,6 +787,7 @@ struct PodLevel {
     loading: u64,                      // Activity id of the "loading pods" spinner
     metrics: Arc<Mutex<MetricsState>>, // written by `metrics_task`, read every frame
     metrics_task: tokio::task::JoinHandle<()>,
+    history: Arc<Mutex<History>>, // written by `metrics_task`, read by the container pane
     events: Store<KubeEvent>, // pod events of the namespace, for the details view
     events_task: tokio::task::JoinHandle<()>,
 }
@@ -813,22 +834,44 @@ fn open_pods(
     }
     // metrics-server only samples every ~15-60s, so poll slowly. Errors mean "not available".
     let metrics = Arc::new(Mutex::new(MetricsState::default()));
+    let history: Arc<Mutex<History>> = Arc::default();
     let metrics_task = {
-        let (client, ns, metrics) = (client.clone(), ns.clone(), metrics.clone());
+        let (client, ns, metrics, history) = (client.clone(), ns.clone(), metrics.clone(), history.clone());
         rt.spawn(async move {
             loop {
                 let result = fetch_metrics(&client, &ns).await;
+                if let Ok(pods) = &result {
+                    let mut h = history.lock().unwrap();
+                    for (pod, containers) in pods {
+                        for (name, u) in containers {
+                            let samples = h.entry((pod.clone(), name.clone())).or_default();
+                            if samples.len() == HISTORY {
+                                samples.pop_front();
+                            }
+                            samples.push_back(*u);
+                        }
+                    }
+                    // Forget pods and containers that are gone, or the map only ever grows.
+                    h.retain(|(pod, name), _| pods.get(pod).is_some_and(|cs| cs.iter().any(|(n, _)| n == name)));
+                }
                 {
                     // The lock is released at the end of this block, before the sleep.
                     let mut m = metrics.lock().unwrap();
                     m.available = Some(result.is_ok());
-                    m.usage = result.unwrap_or_default();
+                    m.usage = result
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(pod, cs)| {
+                            let total = cs.iter().fold(Usage { cpu: 0, mem: 0 }, |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem });
+                            (pod, total)
+                        })
+                        .collect();
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
             }
         })
     };
-    PodLevel { ns, api, store, task, loading, metrics, metrics_task, events, events_task }
+    PodLevel { ns, api, store, task, loading, metrics, metrics_task, history, events, events_task }
 }
 
 #[tokio::main]
@@ -1201,6 +1244,9 @@ fn run_app(
     }
     let started = Instant::now();
     let mut modal: Option<Modal> = None; // delete/new/help popup, when open
+    let mut container_sel = TableState::default(); // selected row of the details Containers table
+    let mut cview: Option<(String, bool)> = None; // container pane: (name, is init)
+    let mut env_sel = TableState::default(); // scroll position of the container's env table
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = String::new(); // result of the last action, cleared on next key
@@ -1248,6 +1294,20 @@ fn run_app(
         if details.is_none() {
             viewing = None;
         }
+        let cdetails = match (&cview, &viewing, &pods) {
+            (Some((c, init)), Some(v), Some(p)) => find_in(&p.store, v).and_then(|o| container_view::build(&o, c, *init)),
+            _ => None,
+        };
+        if cdetails.is_none() {
+            cview = None;
+        }
+        // Usage history of the open container; None when metrics-server has nothing for it.
+        let samples: Option<Vec<Usage>> = match (&cview, &viewing, &pods) {
+            (Some((c, _)), Some(v), Some(p)) => {
+                p.history.lock().unwrap().get(&(v.clone(), c.clone())).map(|d| d.iter().copied().collect())
+            }
+            _ => None,
+        };
 
         let mut crumbs: Vec<String> = vec!["Namespaces".into()];
         if let Some(p) = &pods {
@@ -1261,7 +1321,12 @@ fn run_app(
         } else if let Some(n) = &viewing {
             crumbs.push(n.clone());
             crumbs.push("Details".into());
-            if in_pods { POD_DETAILS_HINTS } else { DETAILS_HINTS }
+            if let Some((c, _)) = &cview {
+                crumbs.push(c.clone());
+            }
+            if cview.is_some() {
+                CONTAINER_HINTS
+            } else if in_pods { POD_DETAILS_HINTS } else { DETAILS_HINTS }
         } else if in_pods {
             POD_HINTS
         } else {
@@ -1274,8 +1339,10 @@ fn run_app(
             render_header(frame, head, info, &crumbs);
             if let Some(v) = &mut yaml {
                 v.render(frame, body, &status);
+            } else if let Some(cd) = &cdetails {
+                container_view::render(frame, body, cd, samples.as_deref(), &mut env_sel, &status);
             } else if let Some(d) = &details {
-                render_details(frame, body, d, &status);
+                render_details(frame, body, d, &mut container_sel, &status);
             } else {
                 render_list(frame, body, metrics.as_ref(), &visible, items.len(), list, &status);
             }
@@ -1372,8 +1439,33 @@ fn run_app(
         let mut yaml_target: Option<String> = None;
         let mut enter_pods: Option<String> = None;
         let mut go_back = false;
-        if viewing.is_some() {
+        if cview.is_some() {
             match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => cview = None,
+                KeyCode::Char('j') | KeyCode::Down => env_sel.select_next(),
+                KeyCode::Char('k') | KeyCode::Up => env_sel.select_previous(),
+                KeyCode::Char('g') => env_sel.select_first(),
+                KeyCode::Char('G') => env_sel.select_last(),
+                KeyCode::Char('y') => {
+                    if let (Some(cd), Some(pod), Some((c, _))) = (&cdetails, &viewing, &cview) {
+                        yaml = Some(YamlView::new(format!("{pod}/{c}"), cd.yaml.clone()));
+                    }
+                }
+                _ => {}
+            }
+        } else if viewing.is_some() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down if in_pods => container_sel.select_next(),
+                KeyCode::Char('k') | KeyCode::Up if in_pods => container_sel.select_previous(),
+                KeyCode::Enter if in_pods => {
+                    let rows = details.as_ref().and_then(|d| d.pod.as_ref()).map(|x| &x.containers);
+                    let i = container_sel.selected().unwrap_or(0);
+                    // select_next can run past the end; the table clamps it only when drawing.
+                    if let Some(r) = rows.and_then(|r| r.get(i.min(r.len().saturating_sub(1)))) {
+                        cview = Some((r.raw_name.clone(), r.init));
+                        env_sel = TableState::default();
+                    }
+                }
                 KeyCode::Char('d') if ctrl => {
                     modal = viewing.clone().map(|name| Modal::Delete { name, kind, yes: false });
                 }
@@ -1410,7 +1502,10 @@ fn run_app(
                 KeyCode::Char('>') => list.sort_col = list.sort_col.step(1),
                 KeyCode::Char('<') => list.sort_col = list.sort_col.step(-1),
                 KeyCode::Char('A') => list.ascending = !list.ascending,
-                KeyCode::Char('d') => viewing = selected.clone(),
+                KeyCode::Char('d') => {
+                    viewing = selected.clone();
+                    container_sel.select_first();
+                }
                 KeyCode::Char('y') => yaml_target = selected.clone(),
                 KeyCode::Char('e') => edit_target = selected.clone(),
                 KeyCode::Enter if !in_pods => enter_pods = selected.clone(),
@@ -1513,6 +1608,25 @@ mod tests {
         assert_eq!(rows[0].state, "CrashLoopBackOff");
         assert_eq!(rows[0].last, "OOMKilled (137)");
         assert_eq!((rows[0].restarts, rows[0].image.as_str()), (4, "team/app:1"));
+    }
+
+    #[test]
+    fn container_view_collects_spec_fields() {
+        let pod: Pod = serde_yaml_ng::from_str(r#"{
+            "metadata": {"name": "p"},
+            "spec": {"containers": [{
+                "name": "app", "image": "reg.io/app:1", "command": ["sh", "-c"], "args": ["echo hi there"],
+                "env": [{"name": "A", "value": "1"}, {"name": "S", "valueFrom": {"secretKeyRef": {"name": "db", "key": "pw"}}}],
+                "ports": [{"containerPort": 8080}],
+                "resources": {"requests": {"memory": "64Mi", "cpu": "100m"}, "limits": {"memory": "128Mi"}},
+                "livenessProbe": {"httpGet": {"path": "/h", "port": 8080}}
+            }]}
+        }"#)
+        .unwrap();
+        let d = container_view::build(&pod, "app", false).unwrap();
+        assert!(container_view::build(&pod, "nope", false).is_none());
+        assert_eq!(d.yaml["name"].as_str(), Some("app"));
+        d.assert_basics();
     }
 
     #[test]
