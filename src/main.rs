@@ -1,4 +1,5 @@
 mod container_view;
+mod log_view;
 mod yaml_view;
 
 use futures::StreamExt;
@@ -577,6 +578,7 @@ const LIST_HINTS: Hints = &[
 const POD_HINTS: Hints = &[
     ("/", "search"),
     ("d", "describe"),
+    ("l", "logs"),
     ("e", "edit"),
     ("y", "yaml"),
     ("^d", "delete"),
@@ -586,8 +588,17 @@ const POD_HINTS: Hints = &[
     ("q", "quit"),
 ];
 const DETAILS_HINTS: Hints = &[("e", "edit"), ("y", "yaml"), ("^n", "new"), ("^d", "delete"), ("Esc", "back")];
-const POD_DETAILS_HINTS: Hints = &[("j/k", "select"), ("Enter", "container"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
-const CONTAINER_HINTS: Hints = &[("j/k", "scroll env"), ("y", "yaml"), ("Esc", "back")];
+const POD_DETAILS_HINTS: Hints = &[("j/k", "select"), ("Enter", "container"), ("l", "logs"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const CONTAINER_HINTS: Hints = &[("j/k", "scroll env"), ("l", "logs"), ("y", "yaml"), ("Esc", "back")];
+const LOG_HINTS: Hints = &[
+    ("1/2/3/0", "1m/5m/15m/all"),
+    ("s", "autoscroll"),
+    ("w", "wrap"),
+    ("j/k", "scroll"),
+    ("g/G", "top/end"),
+    ("h/l", "pan"),
+    ("Esc", "back"),
+];
 const YAML_HINTS: Hints = &[
     ("j/k", "move"),
     ("g/G", "top/bottom"),
@@ -1247,6 +1258,7 @@ fn run_app(
     let mut container_sel = TableState::default(); // selected row of the details Containers table
     let mut cview: Option<(String, bool)> = None; // container pane: (name, is init)
     let mut env_sel = TableState::default(); // scroll position of the container's env table
+    let mut logs: Option<log_view::LogView> = None; // log pane, when open
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = String::new(); // result of the last action, cleared on next key
@@ -1318,6 +1330,10 @@ fn run_app(
             crumbs.push(v.name());
             crumbs.push("YAML".into());
             YAML_HINTS
+        } else if let Some(l) = &logs {
+            crumbs.push(l.pod().to_string());
+            crumbs.push("Logs".into());
+            LOG_HINTS
         } else if let Some(n) = &viewing {
             crumbs.push(n.clone());
             crumbs.push("Details".into());
@@ -1339,6 +1355,8 @@ fn run_app(
             render_header(frame, head, info, &crumbs);
             if let Some(v) = &mut yaml {
                 v.render(frame, body, &status);
+            } else if let Some(l) = &mut logs {
+                l.render(frame, body, &status);
             } else if let Some(cd) = &cdetails {
                 container_view::render(frame, body, cd, samples.as_deref(), &mut env_sel, &status);
             } else if let Some(d) = &details {
@@ -1435,6 +1453,13 @@ fn run_app(
             }
             continue;
         }
+        if let Some(l) = &mut logs {
+            if l.handle_key(key) {
+                logs = None;
+            }
+            continue;
+        }
+        let mut logs_target: Option<(String, Option<String>)> = None; // (pod, only this container)
         let mut edit_target: Option<String> = None;
         let mut yaml_target: Option<String> = None;
         let mut enter_pods: Option<String> = None;
@@ -1444,6 +1469,9 @@ fn run_app(
                 KeyCode::Esc | KeyCode::Char('q') => cview = None,
                 KeyCode::Char('j') | KeyCode::Down => env_sel.select_next(),
                 KeyCode::Char('k') | KeyCode::Up => env_sel.select_previous(),
+                KeyCode::Char('l') => {
+                    logs_target = viewing.clone().zip(cview.clone()).map(|(pod, (c, _))| (pod, Some(c)));
+                }
                 KeyCode::Char('g') => env_sel.select_first(),
                 KeyCode::Char('G') => env_sel.select_last(),
                 KeyCode::Char('y') => {
@@ -1472,6 +1500,7 @@ fn run_app(
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
                 KeyCode::Char('e') => edit_target = viewing.clone(),
+                KeyCode::Char('l') if in_pods => logs_target = viewing.clone().map(|p| (p, None)),
                 KeyCode::Char('y') => yaml_target = viewing.clone(),
                 _ => {}
             }
@@ -1508,6 +1537,7 @@ fn run_app(
                 }
                 KeyCode::Char('y') => yaml_target = selected.clone(),
                 KeyCode::Char('e') => edit_target = selected.clone(),
+                KeyCode::Char('l') if in_pods => logs_target = selected.clone().map(|p| (p, None)),
                 KeyCode::Enter if !in_pods => enter_pods = selected.clone(),
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc if list.query.is_empty() => {
@@ -1524,6 +1554,18 @@ fn run_app(
             }
         }
 
+        if let (Some((name, only)), Some(p)) = (logs_target, &pods) {
+            let all = find_in(&p.store, &name)
+                .and_then(|o| o.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>()))
+                .unwrap_or_default();
+            let containers = match only {
+                Some(c) => vec![c],
+                None => all,
+            };
+            if !containers.is_empty() {
+                logs = Some(log_view::LogView::new(p.api.clone(), rt.clone(), name, containers));
+            }
+        }
         if go_back {
             if let Some(p) = pods.take() {
                 activity.finish(p.loading); // dropping `p` aborts its watcher
