@@ -54,7 +54,11 @@ pub fn builtin() -> Vec<ResourceInfo> {
         version: "v1".into(),
         namespaced: name == "pods",
     };
-    vec![info("namespaces", "namespace", "ns", "Namespace"), info("pods", "pod", "po", "Pod")]
+    vec![
+        info("namespaces", "namespace", "ns", "Namespace"),
+        info("nodes", "node", "no", "Node"),
+        info("pods", "pod", "po", "Pod"),
+    ]
 }
 
 fn collect(list: APIResourceList, out: &mut Vec<ResourceInfo>) {
@@ -168,7 +172,8 @@ mod tests {
     fn core_pods_and_namespaces_are_typed_everything_else_is_generic() {
         let b = builtin();
         assert_eq!(b[0].target(), Target::Namespaces);
-        assert_eq!(b[1].target(), Target::Pods);
+        assert_eq!(b[2].target(), Target::Pods);
+        assert_eq!(b[1].target(), Target::Generic); // nodes use the untyped list with extra columns
         assert_eq!(res("pods", "", &[], "PodMetrics", "metrics.k8s.io").target(), Target::Generic);
         assert_eq!(res("widgets", "", &[], "Widget", "example.com").api_version(), "example.com/v1");
     }
