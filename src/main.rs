@@ -3,8 +3,8 @@ mod yaml_view;
 use futures::StreamExt;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use k8s_openapi::{
-    api::core::v1::{Container, Namespace, Pod},
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    api::core::v1::{Container, ContainerState, Event as KubeEvent, Namespace, Pod},
+    apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
     jiff,
     serde::{Serialize, de::DeserializeOwned},
 };
@@ -188,6 +188,26 @@ fn cpu_text(milli: Option<u64>) -> String {
     milli.map_or("-".into(), |m| format!("{m}m"))
 }
 
+const BAR_CELLS: usize = 6;
+
+/// Braille meter: each cell holds 8 dots, so 6 cells give 48 steps. Scale is the limit,
+/// else the request; with neither (or no metrics) only the dim track shows.
+fn usage_bar(used: Option<u64>, req: Option<u64>, lim: Option<u64>) -> Line<'static> {
+    const LEVELS: [char; 9] = ['⣀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
+    let track = Style::new().fg(Color::DarkGray);
+    let ratio = match (used, lim.or(req)) {
+        (Some(u), Some(d)) if d > 0 => (u as f64 / d as f64).min(1.0),
+        _ => return Line::from(Span::styled("⣀".repeat(BAR_CELLS), track)),
+    };
+    let color = if ratio >= 0.9 { Color::Red } else if ratio >= 0.7 { Color::Yellow } else { Color::Green };
+    let dots = (ratio * (BAR_CELLS * 8) as f64).round() as usize;
+    let spans = (0..BAR_CELLS).map(|i| {
+        let n = dots.saturating_sub(i * 8).min(8);
+        Span::styled(LEVELS[n].to_string(), if n == 0 { track } else { Style::new().fg(color) })
+    });
+    Line::from(spans.collect::<Vec<_>>())
+}
+
 fn mem_text(bytes: Option<u64>) -> String {
     match bytes {
         None => "-".into(),
@@ -292,6 +312,134 @@ fn status_color(s: &str) -> Color {
 struct Details {
     meta: ObjectMeta,
     info: Vec<Line<'static>>,
+    pod: Option<PodExtra>, // pods also show containers, conditions and events
+}
+
+struct ContainerRow {
+    name: String,
+    state: String,
+    color: Color,
+    ready: bool,
+    restarts: i32,
+    last: String,
+    image: String,
+}
+
+struct CondRow {
+    kind: String,
+    ok: bool,
+    age: String,
+    reason: String,
+}
+
+struct EventRow {
+    age: String,
+    kind: String,
+    reason: String,
+    message: String,
+}
+
+struct PodExtra {
+    containers: Vec<ContainerRow>,
+    conditions: Vec<CondRow>,
+    events: Vec<EventRow>, // newest first
+}
+
+fn ago(t: &Time) -> String {
+    format_age(jiff::Timestamp::now().as_second() - t.0.as_second())
+}
+
+/// Init containers first, then the main ones, each joined with its status by name.
+fn container_rows(pod: &Pod) -> Vec<ContainerRow> {
+    let Some(spec) = &pod.spec else { return vec![] };
+    let status = pod.status.as_ref();
+    let init = spec.init_containers.iter().flatten().map(|c| (c, true));
+    let main = spec.containers.iter().map(|c| (c, false));
+    init.chain(main)
+        .map(|(c, is_init)| {
+            let list = if is_init {
+                status.and_then(|s| s.init_container_statuses.as_ref())
+            } else {
+                status.and_then(|s| s.container_statuses.as_ref())
+            };
+            let cs = list.and_then(|l| l.iter().find(|s| s.name == c.name));
+            let (state, color) = match cs.and_then(|s| s.state.as_ref()) {
+                Some(ContainerState { running: Some(r), .. }) => {
+                    (format!("Running {}", r.started_at.as_ref().map_or(String::new(), ago)), Color::Green)
+                }
+                Some(ContainerState { waiting: Some(w), .. }) => {
+                    let reason = w.reason.clone().unwrap_or_else(|| "Waiting".into());
+                    let color = status_color(&reason);
+                    (reason, color)
+                }
+                Some(ContainerState { terminated: Some(t), .. }) => {
+                    let reason = t.reason.clone().unwrap_or_else(|| "Terminated".into());
+                    (format!("{reason} ({})", t.exit_code), if t.exit_code == 0 { Color::Green } else { Color::Red })
+                }
+                _ => ("-".into(), Color::DarkGray),
+            };
+            let last = cs
+                .and_then(|s| s.last_state.as_ref()?.terminated.as_ref())
+                .map(|t| {
+                    let when = t.finished_at.as_ref().map_or(String::new(), |t| format!(" {} ago", ago(t)));
+                    format!("{} ({}){when}", t.reason.clone().unwrap_or_default(), t.exit_code)
+                })
+                .unwrap_or_default();
+            ContainerRow {
+                name: if is_init { format!("init:{}", c.name) } else { c.name.clone() },
+                state,
+                color,
+                ready: cs.is_some_and(|s| s.ready),
+                restarts: cs.map_or(0, |s| s.restart_count),
+                last,
+                image: short_image(c.image.as_deref().unwrap_or_default()),
+            }
+        })
+        .collect()
+}
+
+fn condition_rows(pod: &Pod) -> Vec<CondRow> {
+    pod.status
+        .iter()
+        .flat_map(|s| s.conditions.iter().flatten())
+        .map(|c| CondRow {
+            kind: c.type_.clone(),
+            ok: c.status == "True",
+            age: c.last_transition_time.as_ref().map_or(String::new(), ago),
+            reason: c.reason.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Events about this pod from the namespace's event informer, newest first.
+fn pod_events(pod: &Pod, store: &Store<KubeEvent>) -> Vec<EventRow> {
+    let (name, uid) = (pod.name_any(), pod.metadata.uid.as_deref());
+    let mut found: Vec<(i64, EventRow)> = store
+        .state()
+        .iter()
+        .filter(|e| {
+            e.involved_object.name.as_deref() == Some(&name)
+                && (uid.is_none() || e.involved_object.uid.as_deref() == uid)
+        })
+        .map(|e| {
+            let at = e
+                .last_timestamp
+                .as_ref()
+                .map(|t| t.0.as_second())
+                .or(e.event_time.as_ref().map(|t| t.0.as_second()))
+                .unwrap_or_else(|| created_secs(&e.metadata));
+            let count = e.count.filter(|c| *c > 1).map_or(String::new(), |c| format!(" (x{c})"));
+            let row = EventRow {
+                age: format!("{}{count}", format_age(jiff::Timestamp::now().as_second() - at)),
+                kind: e.type_.clone().unwrap_or_default(),
+                reason: e.reason.clone().unwrap_or_default(),
+                message: e.message.clone().unwrap_or_default().replace('\n', " "),
+            };
+            (at, row)
+        })
+        .collect();
+    found.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    found.into_iter().map(|(_, r)| r).collect()
 }
 
 fn field(k: &str, v: Span<'static>) -> Line<'static> {
@@ -317,39 +465,61 @@ fn ns_details(ns: &Namespace) -> Details {
             field("Created", Span::raw(created_text(&ns.metadata))),
             field("UID", Span::raw(ns.metadata.uid.clone().unwrap_or_default())),
         ],
+        pod: None,
     }
 }
 
-fn pod_details(pod: &Pod) -> Details {
+fn pod_details(pod: &Pod, events: &Store<KubeEvent>) -> Details {
     let cols = pod_cols(pod);
     let status = pod.status.as_ref();
+    let spec = pod.spec.as_ref();
     let text = |v: Option<&String>| Span::raw(v.cloned().unwrap_or_default());
+    let owner = pod
+        .owner_references()
+        .iter()
+        .find(|o| o.controller == Some(true))
+        .map_or(String::new(), |o| format!("{}/{}", o.kind, o.name));
+    let ips = format!(
+        "{} (host {})",
+        status.and_then(|s| s.pod_ip.clone()).unwrap_or_default(),
+        status.and_then(|s| s.host_ip.clone()).unwrap_or_default()
+    );
     Details {
         meta: pod.metadata.clone(),
         info: vec![
             field("Status", status_span(&pod_status(pod))),
-            field("Ready", Span::raw(cols.ready.clone())),
-            field("Restarts", Span::raw(pod_restarts(pod).to_string())),
-            field("Image", Span::raw(cols.image.clone())),
+            field("Owner", Span::raw(owner)),
+            field("Node", text(spec.and_then(|s| s.node_name.as_ref()))),
+            field("IP", Span::raw(ips)),
+            field("QoS", text(status.and_then(|s| s.qos_class.as_ref()))),
+            field("Account", text(spec.and_then(|s| s.service_account_name.as_ref()))),
             field("CPU", Span::raw(format!("req {}  limit {}", cpu_text(cols.cpu_req), cpu_text(cols.cpu_lim)))),
             field("Memory", Span::raw(format!("req {}  limit {}", mem_text(cols.mem_req), mem_text(cols.mem_lim)))),
-            field("Node", text(pod.spec.as_ref().and_then(|s| s.node_name.as_ref()))),
-            field("Pod IP", text(status.and_then(|s| s.pod_ip.as_ref()))),
             field("Created", Span::raw(created_text(&pod.metadata))),
-            field("UID", Span::raw(pod.metadata.uid.clone().unwrap_or_default())),
         ],
+        pod: Some(PodExtra {
+            containers: container_rows(pod),
+            conditions: condition_rows(pod),
+            events: pod_events(pod, events),
+        }),
     }
 }
 
 /// Key/value table for a labels/annotations map, with a count in the title.
-fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>) -> Table<'a> {
+/// At most `limit` rows (the last one becomes "+N more"); the huge last-applied annotation is skipped.
+fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>, limit: usize) -> Table<'a> {
     let dim = Style::new().fg(Color::DarkGray);
     let mut rows: Vec<Row> = map
         .iter()
         .flatten()
+        .filter(|(k, _)| k.as_str() != "kubectl.kubernetes.io/last-applied-configuration")
         .map(|(k, v)| Row::new([Cell::from(k.as_str()).style(Style::new().fg(Color::Cyan)), Cell::from(v.as_str())]))
         .collect();
     let count = rows.len();
+    if count > limit {
+        rows.truncate(limit.saturating_sub(1));
+        rows.push(Row::new([Cell::from(format!("… +{} more", count + 1 - limit)).style(dim)]));
+    }
     if rows.is_empty() {
         rows.push(Row::new([Cell::from("<none>").style(dim)]));
     }
@@ -452,22 +622,90 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
     frame.render_widget(Paragraph::new(help), trail);
 }
 
-/// Details pane: info block, labels table, annotations table.
+/// Details pane. Namespaces: info + labels + annotations. Pods: info and conditions on top,
+/// containers, events, and small labels/annotations tables at the bottom.
 fn render_details(frame: &mut Frame, area: Rect, d: &Details, message: &str) {
     let dim = Style::new().fg(Color::DarkGray);
+    let head = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
     let outer = Block::bordered().title(" Details ").title_bottom(format!(" {message} "));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    let info_box = Paragraph::new(d.info.clone()).block(Block::bordered().border_style(dim).title(" Info "));
 
-    let [info, labels, annotations] =
-        Layout::vertical([Constraint::Length(d.info.len() as u16 + 2), Constraint::Fill(1), Constraint::Fill(1)])
-            .areas(inner);
+    let Some(x) = &d.pod else {
+        let [info, labels, annotations] =
+            Layout::vertical([Constraint::Length(d.info.len() as u16 + 2), Constraint::Fill(1), Constraint::Fill(1)])
+                .areas(inner);
+        frame.render_widget(info_box, info);
+        frame.render_widget(map_table("Labels", &d.meta.labels, usize::MAX), labels);
+        frame.render_widget(map_table("Annotations", &d.meta.annotations, usize::MAX), annotations);
+        return;
+    };
+
+    let [top, containers, events, meta] = Layout::vertical([
+        Constraint::Length(d.info.len().max(x.conditions.len() + 1) as u16 + 2),
+        Constraint::Length(x.containers.len() as u16 + 3),
+        Constraint::Fill(1),
+        Constraint::Length(6),
+    ])
+    .areas(inner);
+    let [info, conds] = Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
+    frame.render_widget(info_box, info);
+
+    let cond_rows = x.conditions.iter().map(|c| {
+        let mark = if c.ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
+        Row::new([Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])), Cell::from(c.age.clone()), Cell::from(c.reason.clone())])
+    });
     frame.render_widget(
-        Paragraph::new(d.info.clone()).block(Block::bordered().border_style(dim).title(" Info ")),
-        info,
+        Table::new(cond_rows, [Constraint::Length(20), Constraint::Length(6), Constraint::Fill(1)])
+            .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
+            .block(Block::bordered().border_style(dim).title(" Conditions ")),
+        conds,
     );
-    frame.render_widget(map_table("Labels", &d.meta.labels), labels);
-    frame.render_widget(map_table("Annotations", &d.meta.annotations), annotations);
+
+    let container_rows = x.containers.iter().map(|c| {
+        let ready = if c.ready { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
+        Row::new([
+            Cell::from(c.name.clone()),
+            Cell::from(c.state.clone()).style(Style::new().fg(c.color)),
+            Cell::from(ready),
+            Cell::from(c.restarts.to_string()),
+            Cell::from(c.last.clone()),
+            Cell::from(c.image.clone()),
+        ])
+    });
+    frame.render_widget(
+        Table::new(
+            container_rows,
+            [Constraint::Fill(2), Constraint::Length(24), Constraint::Length(5), Constraint::Length(8), Constraint::Fill(2), Constraint::Fill(3)],
+        )
+        .header(Row::new(["NAME", "STATE", "READY", "RESTARTS", "LAST STATE", "IMAGE"]).style(head))
+        .block(Block::bordered().border_style(dim).title(format!(" Containers ({}) ", x.containers.len()))),
+        containers,
+    );
+
+    let mut event_rows: Vec<Row> = x
+        .events
+        .iter()
+        .map(|e| {
+            let color = if e.kind == "Warning" { Color::Red } else { Color::Reset };
+            Row::new([Cell::from(e.age.clone()), Cell::from(e.kind.clone()), Cell::from(e.reason.clone()), Cell::from(e.message.clone())])
+                .style(Style::new().fg(color))
+        })
+        .collect();
+    if event_rows.is_empty() {
+        event_rows.push(Row::new([Cell::from("<none>").style(dim)]));
+    }
+    frame.render_widget(
+        Table::new(event_rows, [Constraint::Length(12), Constraint::Length(8), Constraint::Length(20), Constraint::Fill(1)])
+            .header(Row::new(["AGE", "TYPE", "REASON", "MESSAGE"]).style(head))
+            .block(Block::bordered().border_style(dim).title(format!(" Events ({}) ", x.events.len()))),
+        events,
+    );
+
+    let [labels, annotations] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
+    frame.render_widget(map_table("Labels", &d.meta.labels, 3), labels);
+    frame.render_widget(map_table("Annotations", &d.meta.annotations, 3), annotations);
 }
 
 /// One padded, colored "pill". Same text always gets the same color.
@@ -529,6 +767,8 @@ struct PodLevel {
     loading: u64,                      // Activity id of the "loading pods" spinner
     metrics: Arc<Mutex<MetricsState>>, // written by `metrics_task`, read every frame
     metrics_task: tokio::task::JoinHandle<()>,
+    events: Store<KubeEvent>, // pod events of the namespace, for the details view
+    events_task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for PodLevel {
@@ -536,6 +776,7 @@ impl Drop for PodLevel {
         // Dropping a JoinHandle only detaches the task; without abort the watch would run forever.
         self.task.abort();
         self.metrics_task.abort();
+        self.events_task.abort();
     }
 }
 
@@ -548,10 +789,19 @@ fn open_pods(
 ) -> PodLevel {
     let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
     let (store, writer) = reflector::store();
-    let events = reflector(writer, watcher(api.clone(), watcher::Config::default()))
+    let stream = reflector(writer, watcher(api.clone(), watcher::Config::default()))
         .default_backoff()
         .applied_objects();
-    let task = rt.spawn(events.for_each(|_| async {}));
+    let task = rt.spawn(stream.for_each(|_| async {}));
+    // Second informer: only events about pods (server-side field selector).
+    let (events, event_writer) = reflector::store();
+    let event_stream = reflector(
+        event_writer,
+        watcher(Api::<KubeEvent>::namespaced(client.clone(), &ns), watcher::Config::default().fields("involvedObject.kind=Pod")),
+    )
+    .default_backoff()
+    .applied_objects();
+    let events_task = rt.spawn(event_stream.for_each(|_| async {}));
     let loading = activity.start(format!("loading pods in {ns}"));
     {
         let (store, tx) = (store.clone(), tx.clone());
@@ -578,7 +828,7 @@ fn open_pods(
             }
         })
     };
-    PodLevel { ns, api, store, task, loading, metrics, metrics_task }
+    PodLevel { ns, api, store, task, loading, metrics, metrics_task, events, events_task }
 }
 
 #[tokio::main]
@@ -859,8 +1109,12 @@ fn render_list(
             ("READY", None, Constraint::Length(6)),
             ("STATUS", Some(Column::Status), Constraint::Length(17)),
             ("RESTARTS", None, Constraint::Length(8)),
-            ("CPU use/req/lim", None, Constraint::Length(17)),
-            ("MEM use/req/lim", None, Constraint::Length(19)),
+            ("CPU", None, Constraint::Length(BAR_CELLS as u16)),
+            ("REQ", None, Constraint::Length(6)),
+            ("LIM", None, Constraint::Length(6)),
+            ("MEM", None, Constraint::Length(BAR_CELLS as u16)),
+            ("REQ", None, Constraint::Length(7)),
+            ("LIM", None, Constraint::Length(7)),
             ("IMAGE", None, Constraint::Fill(3)),
             ("AGE", Some(Column::Age), Constraint::Length(5)),
         ]
@@ -882,8 +1136,12 @@ fn render_list(
                     Cell::from(p.ready.clone()),
                     status_cell(n),
                     Cell::from(p.restarts.clone()),
-                    Cell::from(format!("{}/{}/{}", cpu_text(u.map(|u| u.cpu)), cpu_text(p.cpu_req), cpu_text(p.cpu_lim))),
-                    Cell::from(format!("{}/{}/{}", mem_text(u.map(|u| u.mem)), mem_text(p.mem_req), mem_text(p.mem_lim))),
+                    Cell::from(usage_bar(u.map(|u| u.cpu), p.cpu_req, p.cpu_lim)),
+                    Cell::from(cpu_text(p.cpu_req)),
+                    Cell::from(cpu_text(p.cpu_lim)),
+                    Cell::from(usage_bar(u.map(|u| u.mem), p.mem_req, p.mem_lim)),
+                    Cell::from(mem_text(p.mem_req)),
+                    Cell::from(mem_text(p.mem_lim)),
                     Cell::from(p.image.clone()),
                     age,
                 ])
@@ -984,7 +1242,7 @@ fn run_app(
 
         // Details are looked up live each frame; if the object vanished, go back to the list.
         let details: Option<Details> = viewing.as_ref().and_then(|n| match &pods {
-            Some(p) => find_in(&p.store, n).map(|o| pod_details(&o)),
+            Some(p) => find_in(&p.store, n).map(|o| pod_details(&o, &p.events)),
             None => find_in(store, n).map(|o| ns_details(&o)),
         });
         if details.is_none() {
@@ -1228,6 +1486,33 @@ mod tests {
         let mut p = pod_with("Running", None);
         p.metadata.deletion_timestamp = Some(Time(jiff::Timestamp::now()));
         assert_eq!(pod_status(&p), "Terminating");
+    }
+
+    #[test]
+    fn bar_fills_by_limit_then_request() {
+        let text = |l: Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        assert_eq!(text(usage_bar(Some(500), None, Some(500))), "⣿⣿⣿⣿⣿⣿");
+        assert_eq!(text(usage_bar(Some(250), Some(100), Some(500))), "⣿⣿⣿⣀⣀⣀");
+        assert_eq!(text(usage_bar(None, Some(1), Some(1))), "⣀⣀⣀⣀⣀⣀");
+        assert_eq!(text(usage_bar(Some(5), None, None)), "⣀⣀⣀⣀⣀⣀");
+    }
+
+    #[test]
+    fn container_rows_show_state_and_last_termination() {
+        let pod: Pod = serde_yaml_ng::from_str(r#"{
+            "metadata": {"name": "p"},
+            "spec": {"containers": [{"name": "app", "image": "reg.io/team/app:1"}]},
+            "status": {"containerStatuses": [{
+                "name": "app", "ready": false, "restartCount": 4, "image": "x", "imageID": "x",
+                "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}
+            }]}
+        }"#)
+        .unwrap();
+        let rows = container_rows(&pod);
+        assert_eq!(rows[0].state, "CrashLoopBackOff");
+        assert_eq!(rows[0].last, "OOMKilled (137)");
+        assert_eq!((rows[0].restarts, rows[0].image.as_str()), (4, "team/app:1"));
     }
 
     #[test]
