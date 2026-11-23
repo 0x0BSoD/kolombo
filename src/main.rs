@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState},
+    widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -577,8 +577,8 @@ const LIST_HINTS: Hints = &[
 // No ^n for pods: a pod can't be made from a name alone.
 const POD_HINTS: Hints = &[
     ("/", "search"),
+    ("Enter", "logs"),
     ("d", "describe"),
-    ("l", "logs"),
     ("e", "edit"),
     ("y", "yaml"),
     ("^d", "delete"),
@@ -924,6 +924,21 @@ enum Modal {
     Delete { name: String, kind: &'static str, yes: bool }, // `yes` = which button is focused
     New(String),                                            // name typed so far
     Help(Hints),                                            // key list of the current pane
+    Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
+}
+
+fn container_names(pod: &Pod) -> Vec<String> {
+    pod.spec.iter().flat_map(|s| s.containers.iter().map(|c| c.name.clone())).collect()
+}
+
+/// Log view of one pod: just `only`, or every container when None.
+fn open_logs(pods: &Option<PodLevel>, rt: &tokio::runtime::Handle, name: String, only: Option<String>) -> Option<log_view::LogView> {
+    let p = pods.as_ref()?;
+    let containers = match only {
+        Some(c) => vec![c],
+        None => container_names(&*find_in(&p.store, &name)?),
+    };
+    (!containers.is_empty()).then(|| log_view::LogView::new(p.api.clone(), rt.clone(), name, containers))
 }
 
 fn render_modal(frame: &mut Frame, modal: &Modal) {
@@ -962,6 +977,20 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
             frame.render_widget(
                 Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")),
                 area,
+            );
+        }
+        Modal::Containers { names, sel, .. } => {
+            let area = frame.area().centered(Constraint::Length(44), Constraint::Length(names.len() as u16 + 3));
+            frame.render_widget(Clear, area);
+            let rows: Vec<Line> = std::iter::once("all containers".to_string()).chain(names.iter().cloned()).map(Line::from).collect();
+            let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
+            let mut state = ListState::default().with_selected(Some(*sel));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                    .block(Block::bordered().title(" Logs of (Enter, Esc) ")),
+                area,
+                &mut state,
             );
         }
         Modal::New(input) => {
@@ -1423,6 +1452,17 @@ fn run_app(
                     _ => Some(Modal::Delete { name, kind, yes }),
                 },
                 Modal::Help(_) => None, // any key closes it
+                Modal::Containers { pod, names, sel } => match key.code {
+                    KeyCode::Enter => {
+                        let only = sel.checked_sub(1).map(|i| names[i].clone());
+                        logs = open_logs(&pods, rt, pod, only);
+                        None
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => None,
+                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Containers { sel: (sel + 1).min(names.len()), pod, names }),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Containers { sel: sel.saturating_sub(1), pod, names }),
+                    _ => Some(Modal::Containers { pod, names, sel }),
+                },
                 Modal::New(mut input) => match key.code {
                     KeyCode::Enter if !input.is_empty() => {
                         let api = api.clone();
@@ -1547,6 +1587,15 @@ fn run_app(
                 KeyCode::Char('e') => edit_target = selected.clone(),
                 KeyCode::Char('l') if in_pods => logs_target = selected.clone().map(|p| (p, None)),
                 KeyCode::Enter if !in_pods => enter_pods = selected.clone(),
+                KeyCode::Enter => {
+                    // one container: straight to its logs; several: ask which
+                    let names = pods.as_ref().and_then(|p| find_in(&p.store, selected.as_deref()?)).map(|o| container_names(&o)).unwrap_or_default();
+                    match (selected.clone(), names.len()) {
+                        (Some(pod), 1) => logs_target = Some((pod, None)),
+                        (Some(pod), n) if n > 1 => modal = Some(Modal::Containers { pod, names, sel: 0 }),
+                        _ => {}
+                    }
+                }
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc if list.query.is_empty() => {
                     if in_pods {
@@ -1562,17 +1611,8 @@ fn run_app(
             }
         }
 
-        if let (Some((name, only)), Some(p)) = (logs_target, &pods) {
-            let all = find_in(&p.store, &name)
-                .and_then(|o| o.spec.as_ref().map(|s| s.containers.iter().map(|c| c.name.clone()).collect::<Vec<_>>()))
-                .unwrap_or_default();
-            let containers = match only {
-                Some(c) => vec![c],
-                None => all,
-            };
-            if !containers.is_empty() {
-                logs = Some(log_view::LogView::new(p.api.clone(), rt.clone(), name, containers));
-            }
+        if let Some((name, only)) = logs_target {
+            logs = open_logs(&pods, rt, name, only);
         }
         if go_back {
             if let Some(p) = pods.take() {
