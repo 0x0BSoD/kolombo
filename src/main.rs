@@ -3,6 +3,7 @@ use k8s_openapi::{api::core::v1::Namespace, jiff};
 use futures::StreamExt;
 use kube::{
     Api, Client,
+    api::PostParams,
     runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
 };
 use ratatui::{
@@ -16,6 +17,7 @@ use ratatui::{
 use std::{
     collections::BTreeMap,
     hash::{DefaultHasher, Hash, Hasher},
+    process::Command,
     time::Duration,
 };
 
@@ -55,7 +57,7 @@ fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>) -> Tabl
 }
 
 /// Fullscreen details: breadcrumb frame, info block, labels table, annotations table.
-fn render_details(frame: &mut Frame, ns: &Namespace) {
+fn render_details(frame: &mut Frame, ns: &Namespace, message: &str) {
     let m = &ns.metadata;
     let name = m.name.clone().unwrap_or_default();
     let phase = ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
@@ -75,7 +77,7 @@ fn render_details(frame: &mut Frame, ns: &Namespace) {
         Span::styled("Details ", bold),
         Span::styled("(Esc back) ", dim),
     ]);
-    let outer = Block::bordered().title(crumbs);
+    let outer = Block::bordered().title(crumbs).title_bottom(format!(" {message} "));
     let inner = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
@@ -147,15 +149,53 @@ async fn main() -> anyhow::Result<()> {
     let api: Api<Namespace> = Api::all(client);
     // Informer: the watcher streams events, the reflector mirrors them into `store`.
     let (store, writer) = reflector::store();
-    let events = reflector(writer, watcher(api, watcher::Config::default()))
+    let events = reflector(writer, watcher(api.clone(), watcher::Config::default()))
         .default_backoff() // retry with backoff on errors instead of ending
         .applied_objects();
     // The stream does nothing unless polled, so drive it in a background task.
     tokio::spawn(events.for_each(|_| async {}));
 
+    let rt = tokio::runtime::Handle::current();
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
-    ratatui::run(|terminal| run_app(terminal, &store))?;
+    // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
+    tokio::task::spawn_blocking(move || ratatui::run(|terminal| run_app(terminal, &store, &api, &rt))).await??;
     Ok(())
+}
+
+/// Open the namespace as YAML in $EDITOR; if changed, send it to the cluster.
+/// Returns a one-line message for the UI.
+fn edit_ns(
+    terminal: &mut DefaultTerminal,
+    rt: &tokio::runtime::Handle,
+    api: &Api<Namespace>,
+    ns: &Namespace,
+) -> anyhow::Result<String> {
+    let name = ns.metadata.name.clone().unwrap_or_default();
+    let mut obj = ns.clone();
+    obj.metadata.managed_fields = None; // noise, kubectl hides it too
+    let before = serde_yaml_ng::to_string(&obj)?;
+    let path = std::env::temp_dir().join(format!("kolombo-{name}.yaml"));
+    std::fs::write(&path, &before)?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let mut parts = editor.split_whitespace(); // EDITOR may carry args, e.g. "code -w"
+    let prog = parts.next().unwrap_or("vi");
+    ratatui::restore(); // give the terminal back to the editor
+    let status = Command::new(prog).args(parts).arg(&path).status();
+    *terminal = ratatui::init(); // and take it again
+    let status = status?;
+    let after = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    let after = after?;
+    if after == before {
+        return Ok("no changes".into());
+    }
+    let edited: Namespace = serde_yaml_ng::from_str(&after)?;
+    rt.block_on(api.replace(&name, &PostParams::default(), &edited))?;
+    Ok(format!("{name} updated"))
 }
 
 /// Names matching `query`, best fuzzy score first. Empty query keeps original order.
@@ -181,7 +221,12 @@ fn format_age(secs: i64) -> String {
     }
 }
 
-fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io::Result<()> {
+fn run_app(
+    terminal: &mut DefaultTerminal,
+    store: &Store<Namespace>,
+    api: &Api<Namespace>,
+    rt: &tokio::runtime::Handle,
+) -> std::io::Result<()> {
     let matcher = SkimMatcherV2::default();
     let mut state = TableState::default().with_selected(Some(0));
     let mut query = String::new();
@@ -189,6 +234,7 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
     let mut sort_col = Column::Name;
     let mut ascending = true;
     let mut viewing: Option<String> = None; // namespace shown in the details view
+    let mut message = String::new(); // result of the last action, cleared on next key
 
     loop {
         // Snapshot of the informer cache; changes as watch events arrive.
@@ -237,10 +283,10 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
 
         terminal.draw(|frame| {
             if let Some(ns) = &details {
-                render_details(frame, ns);
+                render_details(frame, ns, &message);
                 return;
             }
-            let title = format!(" Namespaces {}/{} (/ search, q quit) ", visible.len(), names.len());
+            let title = format!(" Namespaces {}/{} (/ search, d describe, e edit, q quit) ", visible.len(), names.len());
             let now = jiff::Timestamp::now().as_second();
             let rows = visible
                 .iter()
@@ -276,7 +322,7 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
                     .chain(["LABELS".to_string()]))
                     .style(Style::new().add_modifier(Modifier::BOLD)),
                 )
-                .block(Block::bordered().title(title))
+                .block(Block::bordered().title(title).title_bottom(format!(" {message} ")))
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             frame.render_stateful_widget(table, frame.area(), &mut state);
 
@@ -299,9 +345,13 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
         }
         let Event::Key(key) = event::read()? else { continue };
 
+        message.clear();
+        let mut edit_target: Option<String> = None;
         if viewing.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'd')) {
-                viewing = None;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
+                KeyCode::Char('e') => edit_target = viewing.clone(),
+                _ => {}
             }
         } else if typing {
             match key.code {
@@ -329,12 +379,25 @@ fn run_app(terminal: &mut DefaultTerminal, store: &Store<Namespace>) -> std::io:
                 KeyCode::Char('d') => {
                     viewing = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
                 }
+                KeyCode::Char('e') => {
+                    edit_target = state.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
+                }
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Esc if query.is_empty() => return Ok(()),
                 KeyCode::Esc => query.clear(), // first Esc drops the filter
                 KeyCode::Char('j') | KeyCode::Down => state.select_next(),
                 KeyCode::Char('k') | KeyCode::Up => state.select_previous(),
                 _ => {}
+            }
+        }
+
+        if let Some(name) = edit_target {
+            let ns = store.state().iter().find(|ns| ns.metadata.name.as_ref() == Some(&name)).cloned();
+            if let Some(ns) = ns {
+                message = match edit_ns(terminal, rt, api, &ns) {
+                    Ok(m) => m,
+                    Err(e) => format!("edit failed: {e:#}"),
+                };
             }
         }
     }
