@@ -161,7 +161,9 @@ impl LogView {
         self.shared = Arc::default();
         self.tasks = (0..self.containers.len())
             .map(|i| {
-                let (api, pod, name, shared) = (self.api.clone(), self.pod.clone(), self.containers[i].clone(), self.shared.clone());
+                // `self.pod` may be a `namespace/name` list key; the API wants the bare name.
+                let pod = self.pod.rsplit('/').next().unwrap_or(&self.pod).to_string();
+                let (api, name, shared) = (self.api.clone(), self.containers[i].clone(), self.shared.clone());
                 let range = self.range;
                 self.rt.spawn(follow(api, pod, name, i, range, shared))
             })

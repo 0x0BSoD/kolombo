@@ -256,9 +256,10 @@ fn pod_cols(pod: &Pod) -> PodCols {
     }
 }
 
-fn pod_item(pod: &Pod) -> Item {
+/// `all` = the list spans namespaces, so the name alone is not unique: key and shown name are `ns/name`.
+fn pod_item(pod: &Pod, all: bool) -> Item {
     Item {
-        name: pod.name_any(),
+        name: if all { format!("{}/{}", pod.namespace().unwrap_or_default(), pod.name_any()) } else { pod.name_any() },
         status: pod_status(pod),
         created: created_secs(&pod.metadata),
         labels: Vec::new(), // the pod list shows image and resources instead
@@ -289,9 +290,13 @@ type History = HashMap<(String, String), VecDeque<Usage>>;
 
 /// Ask metrics-server (metrics.k8s.io) for every pod of a namespace: pod -> usage per container.
 /// There are no typed structs for it in k8s-openapi, so read it as a dynamic object.
-async fn fetch_metrics(client: &Client, ns: &str) -> Result<HashMap<String, Vec<(String, Usage)>>, kube::Error> {
+async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<String, Vec<(String, Usage)>>, kube::Error> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
-    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &ApiResource::from_gvk_with_plural(&gvk, "pods"));
+    let resource = ApiResource::from_gvk_with_plural(&gvk, "pods");
+    let api: Api<DynamicObject> = match ns {
+        Some(ns) => Api::namespaced_with(client.clone(), ns, &resource),
+        None => Api::all_with(client.clone(), &resource),
+    };
     let list = api.list(&ListParams::default()).await?;
     Ok(list
         .items
@@ -308,7 +313,8 @@ async fn fetch_metrics(client: &Client, ns: &str) -> Result<HashMap<String, Vec<
                     (c["name"].as_str().unwrap_or_default().to_string(), Usage { cpu, mem })
                 })
                 .collect();
-            (o.name_any(), containers)
+            let key = if ns.is_some() { o.name_any() } else { format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any()) };
+            (key, containers)
         })
         .collect())
 }
@@ -578,6 +584,7 @@ const LIST_HINTS: Hints = &[
 const POD_HINTS: Hints = &[
     ("/", "search"),
     ("Enter", "logs"),
+    ("^n", "namespace"),
     ("d", "describe"),
     ("e", "edit"),
     ("y", "yaml"),
@@ -792,7 +799,8 @@ impl ListView {
 
 /// The pod list of one namespace: its own informer, torn down when you go back.
 struct PodLevel {
-    ns: String,
+    scope: Option<String>, // namespace, or None for all namespaces
+    client: Client,
     api: Api<Pod>,
     store: Store<Pod>,
     task: tokio::task::JoinHandle<()>, // drives the watcher stream
@@ -802,6 +810,16 @@ struct PodLevel {
     history: Arc<Mutex<History>>, // written by `metrics_task`, read by the container pane
     events: Store<KubeEvent>, // pod events of the namespace, for the details view
     events_task: tokio::task::JoinHandle<()>,
+}
+
+impl PodLevel {
+    /// Api for the object behind a list key: in the all-namespaces list that is its own namespace.
+    fn api_for(&self, key: &str) -> Api<Pod> {
+        match key.split_once('/') {
+            Some((ns, _)) if self.scope.is_none() => Api::namespaced(self.client.clone(), ns),
+            _ => self.api.clone(),
+        }
+    }
 }
 
 impl Drop for PodLevel {
@@ -818,9 +836,16 @@ fn open_pods(
     rt: &tokio::runtime::Handle,
     tx: &Sender<Done>,
     activity: &mut Activity,
-    ns: String,
+    scope: Option<String>,
 ) -> PodLevel {
-    let api: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    let api: Api<Pod> = match &scope {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
+    let events_api: Api<KubeEvent> = match &scope {
+        Some(ns) => Api::namespaced(client.clone(), ns),
+        None => Api::all(client.clone()),
+    };
     let (store, writer) = reflector::store();
     let stream = reflector(writer, watcher(api.clone(), watcher::Config::default()))
         .default_backoff()
@@ -830,12 +855,12 @@ fn open_pods(
     let (events, event_writer) = reflector::store();
     let event_stream = reflector(
         event_writer,
-        watcher(Api::<KubeEvent>::namespaced(client.clone(), &ns), watcher::Config::default().fields("involvedObject.kind=Pod")),
+        watcher(events_api, watcher::Config::default().fields("involvedObject.kind=Pod")),
     )
     .default_backoff()
     .applied_objects();
     let events_task = rt.spawn(event_stream.for_each(|_| async {}));
-    let loading = activity.start(format!("loading pods in {ns}"));
+    let loading = activity.start(format!("loading pods in {}", scope.as_deref().unwrap_or("all namespaces")));
     {
         let (store, tx) = (store.clone(), tx.clone());
         rt.spawn(async move {
@@ -848,10 +873,10 @@ fn open_pods(
     let metrics = Arc::new(Mutex::new(MetricsState::default()));
     let history: Arc<Mutex<History>> = Arc::default();
     let metrics_task = {
-        let (client, ns, metrics, history) = (client.clone(), ns.clone(), metrics.clone(), history.clone());
+        let (client, ns, metrics, history) = (client.clone(), scope.clone(), metrics.clone(), history.clone());
         rt.spawn(async move {
             loop {
-                let result = fetch_metrics(&client, &ns).await;
+                let result = fetch_metrics(&client, ns.as_deref()).await;
                 if let Ok(pods) = &result {
                     let mut h = history.lock().unwrap();
                     for (pod, containers) in pods {
@@ -883,7 +908,7 @@ fn open_pods(
             }
         })
     };
-    PodLevel { ns, api, store, task, loading, metrics, metrics_task, history, events, events_task }
+    PodLevel { scope, client: client.clone(), api, store, task, loading, metrics, metrics_task, history, events, events_task }
 }
 
 #[tokio::main]
@@ -925,6 +950,7 @@ enum Modal {
     New(String),                                            // name typed so far
     Help(Hints),                                            // key list of the current pane
     Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
+    Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
 }
 
 fn container_names(pod: &Pod) -> Vec<String> {
@@ -938,10 +964,10 @@ fn open_logs(pods: &Option<PodLevel>, rt: &tokio::runtime::Handle, name: String,
         Some(c) => vec![c],
         None => container_names(&*find_in(&p.store, &name)?),
     };
-    (!containers.is_empty()).then(|| log_view::LogView::new(p.api.clone(), rt.clone(), name, containers))
+    (!containers.is_empty()).then(|| log_view::LogView::new(p.api_for(&name), rt.clone(), name, containers))
 }
 
-fn render_modal(frame: &mut Frame, modal: &Modal) {
+fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String]) {
     match modal {
         Modal::Delete { name, kind, yes } => {
             let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(5));
@@ -992,6 +1018,25 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
                 area,
                 &mut state,
             );
+        }
+        Modal::Namespaces { query, sel, current } => {
+            let height = (ns_matches.len() as u16 + 4).min(frame.area().height * 7 / 10).max(5);
+            let area = frame.area().centered(Constraint::Length(50), Constraint::Length(height));
+            frame.render_widget(Clear, area);
+            let block = Block::bordered().title(" Namespace (Enter, Esc) ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled("> ", Style::new().fg(Color::Yellow)), Span::raw(query.as_str())])), input);
+            let mark = |on: bool| if on { " ●" } else { "" };
+            let mut items = vec![ListItem::new(Line::from(vec![
+                Span::styled("all namespaces", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(mark(current.is_none())),
+            ]))];
+            items.extend(ns_matches.iter().map(|n| ListItem::new(format!("{n}{}", mark(current.as_deref() == Some(n.as_str()))))));
+            let mut state = ListState::default().with_selected(Some((*sel).min(ns_matches.len())));
+            frame.render_stateful_widget(List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)), list, &mut state);
+            frame.set_cursor_position((input.x + 2 + query.chars().count() as u16, input.y));
         }
         Modal::New(input) => {
             let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
@@ -1138,7 +1183,15 @@ fn edit_flow<K: Kind>(
 }
 
 fn find_in<K: Kind>(store: &Store<K>, name: &str) -> Option<Arc<K>> {
-    store.state().into_iter().find(|o| o.meta().name.as_deref() == Some(name))
+    // A key with a '/' is `namespace/name` (all-namespaces pod list); names themselves never contain one.
+    let (ns, name) = match name.split_once('/') {
+        Some((ns, n)) => (Some(ns), n),
+        None => (None, name),
+    };
+    store
+        .state()
+        .into_iter()
+        .find(|o| o.meta().name.as_deref() == Some(name) && (ns.is_none() || o.meta().namespace.as_deref() == ns))
 }
 
 /// Items matching `query`, best fuzzy score first. Empty query keeps original order.
@@ -1308,11 +1361,29 @@ fn run_app(
 
         // Snapshot of the active level's informer cache; changes as watch events arrive.
         let items: Vec<Item> = match &pods {
-            Some(p) => p.store.state().iter().map(|o| pod_item(o)).collect(),
+            Some(p) => p.store.state().iter().map(|o| pod_item(o, p.scope.is_none())).collect(),
             None => store.state().iter().map(|o| ns_item(o)).collect(),
         };
         // Copy of the latest usage numbers (cloned so the lock isn't held while drawing).
         let metrics: Option<MetricsState> = pods.as_ref().map(|p| p.metrics.lock().unwrap().clone());
+        // Rows of the open namespace picker, best fuzzy match first. "all namespaces" is not in here:
+        // it is always row 0, whatever is typed.
+        let ns_matches: Vec<String> = match &modal {
+            Some(Modal::Namespaces { query, .. }) => {
+                let mut scored: Vec<(i64, String)> = store
+                    .state()
+                    .iter()
+                    .filter_map(|n| {
+                        let name = n.name_any();
+                        let score = if query.is_empty() { 0 } else { matcher.fuzzy_match(&name, query)? };
+                        Some((score, name))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                scored.into_iter().map(|(_, n)| n).collect()
+            }
+            _ => vec![],
+        };
         let list = lists.last_mut().unwrap();
         let mut visible = filter(&items, &list.query, &matcher);
         // With a query, fuzzy rank wins; otherwise apply the chosen sort.
@@ -1353,7 +1424,7 @@ fn run_app(
 
         let mut crumbs: Vec<String> = vec!["Namespaces".into()];
         if let Some(p) = &pods {
-            crumbs.push(p.ns.clone());
+            crumbs.push(p.scope.clone().unwrap_or_else(|| "All namespaces".into()));
             crumbs.push("Pods".into());
         }
         let hints: Hints = if let Some(v) = &yaml {
@@ -1402,7 +1473,7 @@ fn run_app(
                 render_list(frame, body, metrics.as_ref(), &visible, items.len(), list, &status);
             }
             if let Some(m) = &modal {
-                render_modal(frame, m);
+                render_modal(frame, m, &ns_matches);
             }
             if typing && yaml.is_none() && details.is_none() {
                 // Floating box: 50% wide, 3 rows tall, centered.
@@ -1434,7 +1505,8 @@ fn run_app(
                         let label = format!("deleting {name}");
                         match &pods {
                             Some(p) => {
-                                let api = p.api.clone();
+                                let api = p.api_for(&name);
+                                let name = name.rsplit('/').next().unwrap_or(&name).to_string(); // key -> real name
                                 spawn_op(rt, &tx, &mut activity, label, async move { delete_obj(&api, &name).await });
                             }
                             None => {
@@ -1452,6 +1524,41 @@ fn run_app(
                     _ => Some(Modal::Delete { name, kind, yes }),
                 },
                 Modal::Help(_) => None, // any key closes it
+                Modal::Namespaces { mut query, sel, current } => {
+                    let sel = sel.min(ns_matches.len());
+                    match key.code {
+                        KeyCode::Enter => {
+                            // row 0 = all namespaces, then the matches
+                            let target = match sel.checked_sub(1) {
+                                None => Some(None),
+                                Some(i) => ns_matches.get(i).map(|n| Some(n.clone())),
+                            };
+                            if let Some(scope) = target.filter(|t| *t != current) {
+                                if let Some(old) = pods.take() {
+                                    activity.finish(old.loading); // dropping `old` aborts its watchers
+                                }
+                                pods = Some(open_pods(client, rt, &tx, &mut activity, scope));
+                                *lists.last_mut().unwrap() = ListView::new();
+                                viewing = None;
+                            }
+                            None
+                        }
+                        KeyCode::Esc => None,
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Namespaces { query, sel: (sel + 1).min(ns_matches.len()), current }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Namespaces { query, sel: sel.saturating_sub(1), current }),
+                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Namespaces { query, sel: (sel + 1).min(ns_matches.len()), current }),
+                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Namespaces { query, sel: sel.saturating_sub(1), current }),
+                        KeyCode::Char(c) if !ctrl => {
+                            query.push(c);
+                            Some(Modal::Namespaces { query, sel: 1, current }) // best match preselected
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            Some(Modal::Namespaces { sel: usize::from(!query.is_empty()), query, current })
+                        }
+                        _ => Some(Modal::Namespaces { query, sel, current }),
+                    }
+                }
                 Modal::Containers { pod, names, sel } => match key.code {
                     KeyCode::Enter => {
                         let only = sel.checked_sub(1).map(|i| names[i].clone());
@@ -1575,6 +1682,10 @@ fn run_app(
                     modal = selected.clone().map(|name| Modal::Delete { name, kind, yes: false });
                 }
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
+                KeyCode::Char('n') if ctrl => {
+                    let current = pods.as_ref().and_then(|p| p.scope.clone());
+                    modal = Some(Modal::Namespaces { query: String::new(), sel: 0, current });
+                }
                 KeyCode::Char('/') => typing = true,
                 KeyCode::Char('>') => list.sort_col = list.sort_col.step(1),
                 KeyCode::Char('<') => list.sort_col = list.sort_col.step(-1),
@@ -1621,7 +1732,7 @@ fn run_app(
             lists.pop();
         }
         if let Some(ns) = enter_pods {
-            pods = Some(open_pods(client, rt, &tx, &mut activity, ns));
+            pods = Some(open_pods(client, rt, &tx, &mut activity, Some(ns)));
             lists.push(ListView::new());
         }
         if let Some(name) = yaml_target {
@@ -1633,7 +1744,7 @@ fn run_app(
         }
         if let Some(name) = edit_target {
             match &pods {
-                Some(p) => edit_flow(terminal, rt, &tx, &mut activity, &p.api, &p.store, &name, &mut message),
+                Some(p) => edit_flow(terminal, rt, &tx, &mut activity, &p.api_for(&name), &p.store, &name, &mut message),
                 None => edit_flow(terminal, rt, &tx, &mut activity, api, store, &name, &mut message),
             }
         }
@@ -1717,6 +1828,24 @@ mod tests {
         assert!(container_view::build(&pod, "nope", false).is_none());
         assert_eq!(d.yaml["name"].as_str(), Some("app"));
         d.assert_basics();
+    }
+
+    #[test]
+    fn find_in_accepts_plain_names_and_namespaced_keys() {
+        let pod = |ns: &str| {
+            let mut p = Pod::default();
+            p.metadata.name = Some("web".into());
+            p.metadata.namespace = Some(ns.into());
+            p
+        };
+        let (store, mut writer) = reflector::store::<Pod>();
+        writer.apply_watcher_event(&watcher::Event::Apply(pod("a")));
+        writer.apply_watcher_event(&watcher::Event::Apply(pod("b")));
+        assert_eq!(find_in(&store, "b/web").unwrap().namespace().as_deref(), Some("b"));
+        assert!(find_in(&store, "c/web").is_none());
+        assert!(find_in(&store, "web").is_some());
+        assert_eq!(pod_item(&pod("a"), true).name, "a/web");
+        assert_eq!(pod_item(&pod("a"), false).name, "web");
     }
 
     #[test]
