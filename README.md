@@ -16,6 +16,10 @@ Kolombo reads your kubeconfig the same way `kubectl` does and uses its current c
 - **Namespaces and pods**, kept live by watchers. `Enter` on a namespace opens its pods.
 - **Any resource type, CRDs included**, through `:` (see below). Pods and namespaces have dedicated
   views; everything else opens in a generic list.
+- **Networking and Gateway API** panes (Ingress, IngressClass, NetworkPolicy, GatewayClass, Gateway,
+  ListenerSet, HTTPRoute and the other routes, ReferenceGrant, BackendTLSPolicy). `Enter` walks down
+  the hierarchy: GatewayClass → Gateway → ListenerSet → HTTPRoute → Service → Pods (`r` on a Gateway
+  or ListenerSet jumps straight to its routes). `Esc` climbs back one level at a time.
 - **Nodes** with gauges for CPU, memory and pod count, roles, version, IP and OS image.
   `Enter` shows the pods running on that node.
 - **Pod details**: containers with state and last termination, conditions, events, labels and

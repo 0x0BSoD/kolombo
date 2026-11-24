@@ -32,11 +32,33 @@ pub enum Pane {
     ResourceQuota,
     LimitRange,
     ReplicationController,
+    // networking.k8s.io and gateway.networking.k8s.io (see net_panes.rs)
+    Ingress,
+    IngressClass,
+    NetworkPolicy,
+    GatewayClass,
+    Gateway,
+    ListenerSet,
+    Route, // HTTPRoute, GRPCRoute and the other route kinds share their shape
+    ReferenceGrant,
+    BackendTlsPolicy,
 }
 
 impl Pane {
+    fn is_apps(self) -> bool {
+        matches!(self, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::ControllerRevision)
+    }
+
+    fn is_net(self) -> bool {
+        matches!(
+            self,
+            Pane::Ingress | Pane::IngressClass | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route
+                | Pane::ReferenceGrant | Pane::BackendTlsPolicy
+        )
+    }
+
     fn is_core(self) -> bool {
-        !matches!(self, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::ControllerRevision)
+        !self.is_apps() && !self.is_net()
     }
 }
 
@@ -58,12 +80,15 @@ pub fn kind_of(info: &ResourceInfo) -> Option<Pane> {
         ("", "resourcequotas") => Some(Pane::ResourceQuota),
         ("", "limitranges") => Some(Pane::LimitRange),
         ("", "replicationcontrollers") => Some(Pane::ReplicationController),
-        _ => None,
+        _ => crate::net_panes::kind_of(info),
     }
 }
 
 /// Columns between STATUS and AGE (NAME, STATUS and AGE are the same everywhere).
 pub fn columns(w: Pane) -> Vec<(&'static str, Constraint)> {
+    if w.is_net() {
+        return crate::net_panes::columns(w);
+    }
     if w.is_core() {
         return crate::core_panes::columns(w);
     }
@@ -147,7 +172,11 @@ fn selector(o: &DynamicObject) -> String {
 /// `spec.selector` as a label-selector string for the API (`app=web,tier in (a,b),!canary`).
 /// Workloads use `matchLabels`/`matchExpressions`; Services and ReplicationControllers use a plain map.
 pub fn label_selector(o: &DynamicObject) -> String {
-    let sel = &o.data["spec"]["selector"];
+    selector_string(&o.data["spec"]["selector"])
+}
+
+/// Same for any selector value: a NetworkPolicy's `spec.podSelector`, say.
+pub fn selector_string(sel: &Value) -> String {
     let structured = sel.get("matchLabels").is_some() || sel.get("matchExpressions").is_some();
     let labels = if structured { &sel["matchLabels"] } else { sel };
     let mut parts: Vec<String> = labels.as_object().into_iter().flatten().map(|(k, v)| format!("{k}={}", text(v))).collect();
@@ -184,6 +213,9 @@ fn condition<'a>(o: &'a DynamicObject, kind: &str) -> Option<&'a Value> {
 
 /// One word for the STATUS column.
 pub fn status(w: Pane, o: &DynamicObject) -> String {
+    if w.is_net() {
+        return crate::net_panes::status(w, o);
+    }
     if w.is_core() {
         return crate::core_panes::status(w, o);
     }
@@ -236,6 +268,9 @@ pub fn status(w: Pane, o: &DynamicObject) -> String {
 
 /// Text and color for each of `columns(w)`.
 pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
+    if w.is_net() {
+        return crate::net_panes::cells(w, o);
+    }
     if w.is_core() {
         return crate::core_panes::cells(w, o);
     }
@@ -306,6 +341,9 @@ pub(crate) fn lines(label: &str, values: Vec<Vec<Span<'static>>>) -> Vec<Line<'s
 
 /// Rows of the describe view: what the controller wants, what it has, how it rolls, what it runs.
 pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
+    if w.is_net() {
+        return crate::net_panes::info_rows(w, o);
+    }
     if w.is_core() {
         return crate::core_panes::info_rows(w, o);
     }

@@ -2,7 +2,7 @@
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
 use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
+    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, HOP_HINTS, HOP_HINTS_NS, ROUTES_HINTS, ROUTES_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
     field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
 };
 use crate::resources::ResourceInfo;
@@ -22,7 +22,7 @@ use ratatui::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
-use crate::{nodes, panes};
+use crate::{net_panes, nodes, panes};
 use tokio::task::JoinHandle;
 
 /// What the main loop must do after a key.
@@ -30,6 +30,7 @@ pub enum Action {
     Close,
     Quit,
     Pods { scope: Option<String>, filter: PodFilter }, // Enter on a node or workload: its pods
+    Open { targets: Vec<net_panes::Target>, path: Vec<String> }, // Enter on a Gateway, route...: the next list down
     Cordon(String),
     Uncordon(String),
     Drain(String), // opens the drain options popup
@@ -38,6 +39,14 @@ pub enum Action {
     Copy(String),
     Delete(String), // list key
     Edit(String),
+}
+
+/// Hides every object that is not a child of the one we drilled down from. Done on our side because
+/// the relations (parentRefs, backendRefs...) live in `spec`, which field selectors cannot reach.
+#[derive(Clone)]
+pub struct Filter {
+    pub crumbs: Vec<String>, // the path that led here
+    pub keep: net_panes::Keep,
 }
 
 pub struct GenericView {
@@ -57,6 +66,7 @@ pub struct GenericView {
     viewing: Option<String>,
     yaml: Option<YamlView>,
     typing: bool,
+    pub filter: Option<Filter>, // set when this list is a drill-down
 }
 
 impl Drop for GenericView {
@@ -191,6 +201,7 @@ impl GenericView {
             viewing: None,
             yaml: None,
             typing: false,
+            filter: None,
         }
     }
 
@@ -213,19 +224,26 @@ impl GenericView {
     fn items(&self) -> Vec<Item> {
         let all = self.all();
         let counts = self.pods.as_ref().map(nodes::pod_counts).or_else(|| nodes::is_nodes(&self.info).then(HashMap::new));
-        self.store.state().iter().map(|o| dyn_item(o, all, counts.as_ref(), panes::kind_of(&self.info))).collect()
+        let keep = |o: &&Arc<DynamicObject>| self.filter.as_ref().is_none_or(|f| (f.keep)(o));
+        self.store.state().iter().filter(keep).map(|o| dyn_item(o, all, counts.as_ref(), panes::kind_of(&self.info))).collect()
     }
 
     fn all(&self) -> bool {
         self.info.namespaced && self.scope.is_none()
     }
 
-    pub fn crumbs(&self) -> Vec<String> {
-        let mut c = Vec::new();
-        if let Some(ns) = &self.scope {
-            c.push(ns.clone());
-        }
+    /// Where this list sits: the path that led here, or its namespace, then the type.
+    fn base_crumbs(&self) -> Vec<String> {
+        let mut c = match &self.filter {
+            Some(f) => f.crumbs.clone(),
+            None => self.scope.iter().cloned().collect(),
+        };
         c.push(self.info.name.clone());
+        c
+    }
+
+    pub fn crumbs(&self) -> Vec<String> {
+        let mut c = self.base_crumbs();
         if let Some(n) = &self.viewing {
             c.push(n.clone());
             c.push("Details".into());
@@ -237,22 +255,33 @@ impl GenericView {
         c
     }
 
+    /// Namespace picker only on a plain list: a drill-down is pinned to what it came from.
+    fn can_pick_namespace(&self) -> bool {
+        self.info.namespaced && self.filter.is_none()
+    }
+
     pub fn hints(&self) -> Hints {
+        let ns = self.can_pick_namespace();
+        let pane = panes::kind_of(&self.info);
         if self.yaml.is_some() {
             YAML_HINTS
         } else if self.viewing.is_some() {
             if nodes::is_nodes(&self.info) {
                 NODE_DETAILS_HINTS
-            } else if self.info.namespaced {
+            } else if ns {
                 GENERIC_DETAILS_HINTS_NS
             } else {
                 GENERIC_DETAILS_HINTS
             }
         } else if nodes::is_nodes(&self.info) {
             NODE_HINTS
-        } else if panes::kind_of(&self.info).is_some_and(panes::has_pods) {
-            if self.info.namespaced { WORKLOAD_HINTS_NS } else { WORKLOAD_HINTS }
-        } else if self.info.namespaced {
+        } else if pane.is_some_and(panes::has_pods) {
+            if ns { WORKLOAD_HINTS_NS } else { WORKLOAD_HINTS }
+        } else if pane.is_some_and(net_panes::has_routes) {
+            if ns { ROUTES_HINTS_NS } else { ROUTES_HINTS }
+        } else if pane.is_some_and(net_panes::has_hop) {
+            if ns { HOP_HINTS_NS } else { HOP_HINTS }
+        } else if ns {
             GENERIC_HINTS_NS
         } else {
             GENERIC_HINTS
@@ -318,7 +347,7 @@ impl GenericView {
                 KeyCode::Char('d') if ctrl => return Some(Action::Delete(k)),
                 KeyCode::Char('e') => return Some(Action::Edit(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
-                KeyCode::Char('n') if ctrl && self.info.namespaced => return Some(Action::PickNamespace),
+                KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
                 KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
                 KeyCode::Char('u') if node => return Some(Action::Uncordon(k)),
                 KeyCode::Char('C') if node => return Some(Action::Drain(k)),
@@ -350,7 +379,7 @@ impl GenericView {
         let selected = self.selected();
         match key.code {
             KeyCode::Char('d') if ctrl => return selected.map(Action::Delete),
-            KeyCode::Char('n') if ctrl && self.info.namespaced => return Some(Action::PickNamespace),
+            KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char(':') => return Some(Action::Command),
             KeyCode::Char('>') => self.list.sort_col = self.list.sort_col.step(1),
@@ -359,7 +388,7 @@ impl GenericView {
             KeyCode::Enter if node => {
                 return selected.map(|n| Action::Pods {
                     scope: None,
-                    filter: PodFilter { crumbs: vec!["nodes".into(), n.clone()], fields: Some(format!("spec.nodeName={n}")), labels: None },
+                    filter: PodFilter { crumbs: self.path_to(&n), fields: Some(format!("spec.nodeName={n}")), labels: None },
                 });
             }
             KeyCode::Enter if panes::kind_of(&self.info).is_some_and(panes::has_pods) => {
@@ -369,6 +398,17 @@ impl GenericView {
                         None => self.viewing = Some(k), // no usable selector: describe instead
                     }
                 }
+            }
+            KeyCode::Enter if panes::kind_of(&self.info).is_some_and(net_panes::has_hop) => {
+                if let Some(k) = selected {
+                    match self.hop(&k, false) {
+                        Some(action) => return Some(action),
+                        None => self.viewing = Some(k),
+                    }
+                }
+            }
+            KeyCode::Char('r') if panes::kind_of(&self.info).is_some_and(net_panes::has_routes) => {
+                return selected.and_then(|k| self.hop(&k, true));
             }
             KeyCode::Char('c') if node => return selected.map(Action::Cordon),
             KeyCode::Char('u') if node => return selected.map(Action::Uncordon),
@@ -390,13 +430,32 @@ impl GenericView {
         None
     }
 
+    /// Crumbs for a list opened from `key` of this one.
+    fn path_to(&self, key: &str) -> Vec<String> {
+        let mut path = self.base_crumbs();
+        path.push(key.to_string());
+        path
+    }
+
+    /// The next list down from `key`: Enter, or `r` for the routes of a Gateway or ListenerSet.
+    fn hop(&self, key: &str, routes: bool) -> Option<Action> {
+        let w = panes::kind_of(&self.info)?;
+        let o = crate::find_in(&self.store, key)?;
+        let hop = if routes { net_panes::routes(w, &o) } else { net_panes::enter(w, &o) }?;
+        let path = self.path_to(key);
+        Some(match hop {
+            net_panes::Hop::Open(targets) => Action::Open { targets, path },
+            net_panes::Hop::Pods(labels) => Action::Pods { scope: o.namespace(), filter: PodFilter { crumbs: path, fields: None, labels } },
+        })
+    }
+
     /// The pods a workload selects: its own namespace plus its `spec.selector`.
     fn workload_pods(&self, key: &str) -> Option<Action> {
         let o = crate::find_in(&self.store, key)?;
         let labels = Some(panes::label_selector(&o)).filter(|s| !s.is_empty())?;
         Some(Action::Pods {
             scope: o.namespace(),
-            filter: PodFilter { crumbs: vec![self.info.name.clone(), key.to_string()], fields: None, labels: Some(labels) },
+            filter: PodFilter { crumbs: self.path_to(key), fields: None, labels: Some(labels) },
         })
     }
 

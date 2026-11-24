@@ -3,6 +3,7 @@ mod dashboard;
 mod drain;
 mod generic_view;
 mod log_view;
+mod net_panes;
 mod nodes;
 mod core_panes;
 mod panes;
@@ -338,7 +339,7 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
 fn status_color(s: &str) -> Color {
     match s {
         "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
-        | "Established" | "OK" | "Normal" => Color::Green,
+        | "Established" | "OK" | "Normal" | "Programmed" | "Accepted" => Color::Green,
         "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" | "Released" | "Degraded"
         | "AtLimit" | "Warning" => Color::Yellow,
         "ScaledToZero" | "NoNodes" => Color::DarkGray,
@@ -678,6 +679,59 @@ const GENERIC_DETAILS_HINTS_NS: Hints =
     &[("^n", "namespace"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
 const WORKLOAD_HINTS: Hints = &[
     ("Enter", "pods"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+// Types with a next level down (Gateway API, Ingress...): Enter walks the hierarchy.
+const HOP_HINTS_NS: Hints = &[
+    ("Enter", "open next"),
+    ("^n", "namespace"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+const HOP_HINTS: Hints = &[
+    ("Enter", "open next"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+const ROUTES_HINTS_NS: Hints = &[
+    ("Enter", "open next"),
+    ("r", "routes"),
+    ("^n", "namespace"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+const ROUTES_HINTS: Hints = &[
+    ("Enter", "open next"),
+    ("r", "routes"),
     ("d", "describe"),
     ("/", "search"),
     (":", "resource"),
@@ -1657,7 +1711,7 @@ fn run_app(
     let mut logs: Option<log_view::LogView> = None; // log pane, when open
     let mut generic: Option<generic_view::GenericView> = None; // list of any other resource type
     let mut dashboard: Option<dashboard::Dashboard> = None; // the start screen
-    let mut parked: Option<generic_view::GenericView> = None; // the node list while its pods are shown
+    let mut parked: Vec<generic_view::GenericView> = Vec::new(); // the lists we came down from, nearest last
     let pods_info = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
@@ -1695,7 +1749,7 @@ fn run_app(
 
         // Mirror what is on screen into `state`; write the file only when something changed.
         state.sort.namespaces = state::Sort::of(&lists[0]);
-        if let Some(g) = &generic {
+        if let Some(g) = generic.as_ref().filter(|g| g.filter.is_none()) {
             state.sort.resource = state::Sort::of(&g.list);
             state.resource = g.info.clone();
             state.namespace = g.scope.clone();
@@ -1997,6 +2051,7 @@ fn run_app(
                                         .or_else(|| pods.as_ref().map(|p| p.scope.clone()))
                                         .unwrap_or_else(|| if dashboard.is_some() { state.namespace.clone() } else { selected.clone() });
                                     dashboard = None;
+                                    parked.clear();
                                     if let Some(old) = generic.take() {
                                         activity.finish(old.loading);
                                     }
@@ -2008,7 +2063,7 @@ fn run_app(
                                             }
                                         }
                                         resources::Target::Namespaces | resources::Target::Dashboard => {
-                                            parked = None;
+                                            parked.clear();
                                             if let Some(p) = pods.take() {
                                                 activity.finish(p.loading);
                                                 lists.pop();
@@ -2018,6 +2073,10 @@ fn run_app(
                                             }
                                         }
                                         resources::Target::Generic => {
+                                            if let Some(p) = pods.take() {
+                                                activity.finish(p.loading);
+                                                lists.pop();
+                                            }
                                             generic = Some(open_generic(client, rt, &tx, &mut activity, r.clone(), scope, state.sort.resource));
                                         }
                                     }
@@ -2112,6 +2171,20 @@ fn run_app(
                     if let Some(g) = generic.take() {
                         activity.finish(g.loading);
                     }
+                    generic = parked.pop(); // one level up, when this list was a drill-down
+                }
+                Some(generic_view::Action::Open { targets, path }) => {
+                    let types = resource_types.get().unwrap_or(&builtin_types);
+                    let found = targets.into_iter().find_map(|t| Some((resources::find(types, t.group, t.plural)?, t.keep)));
+                    match found {
+                        Some((info, keep)) => {
+                            parked.extend(generic.take());
+                            let mut view = open_generic(client, rt, &tx, &mut activity, info, None, state.sort.resource);
+                            view.filter = Some(generic_view::Filter { crumbs: path, keep });
+                            generic = Some(view);
+                        }
+                        None => message = "this cluster does not serve that resource type (or discovery is still loading)".into(),
+                    }
                 }
                 Some(generic_view::Action::Quit) => return Ok(()),
                 Some(generic_view::Action::Cordon(node)) => {
@@ -2127,7 +2200,7 @@ fn run_app(
                 }
 
                 Some(generic_view::Action::Pods { scope, filter }) => {
-                    parked = generic.take(); // keep the list to come back to
+                    parked.extend(generic.take()); // keep the list to come back to
                     if let Some(old) = pods.take() {
                         activity.finish(old.loading);
                         lists.pop();
@@ -2272,7 +2345,7 @@ fn run_app(
                 activity.finish(p.loading); // dropping `p` aborts its watcher
             }
             lists.pop();
-            generic = parked.take(); // back to the node list, if that is where we came from
+            generic = parked.pop(); // back to the list we came from, if any
         }
         if let Some(ns) = enter_pods {
             pods = Some(open_pods(client, rt, &tx, &mut activity, Some(ns), None));

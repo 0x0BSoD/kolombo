@@ -120,6 +120,11 @@ pub async fn discover(client: &Client) -> Vec<ResourceInfo> {
     out
 }
 
+/// The served type with this group and plural name (preferred version).
+pub fn find(all: &[ResourceInfo], group: &str, plural: &str) -> Option<ResourceInfo> {
+    all.iter().find(|r| r.group == group && r.name == plural).cloned()
+}
+
 /// Match strength of `query` against one resource; None = not a match.
 /// Exact name/alias/singular/kind beats a prefix, which beats a fuzzy match.
 fn score(info: &ResourceInfo, query: &str, matcher: &SkimMatcherV2) -> Option<i64> {
