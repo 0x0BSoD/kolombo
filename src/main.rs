@@ -3,6 +3,7 @@ mod drain;
 mod generic_view;
 mod log_view;
 mod nodes;
+mod workloads;
 mod resources;
 mod state;
 mod yaml_view;
@@ -63,6 +64,7 @@ struct Item {
     labels: Vec<(String, String)>, // user labels only, sorted by key
     pod: Option<PodCols>,          // pod-only columns; None for namespaces
     node: Option<nodes::NodeCols>, // node-only columns
+    extra: Option<Vec<(String, Color)>>, // workload columns, in the order of `workloads::columns`
 }
 
 /// True for `kubernetes.io/...` and `*.kubernetes.io/...` keys (system-managed).
@@ -93,6 +95,7 @@ fn ns_item(ns: &Namespace) -> Item {
         labels: labels_of(&ns.metadata, true),
         pod: None,
         node: None,
+        extra: None,
     }
 }
 
@@ -274,6 +277,7 @@ fn pod_item(pod: &Pod, all: bool) -> Item {
         labels: Vec::new(), // the pod list shows image and resources instead
         pod: Some(pod_cols(pod)),
         node: None,
+        extra: None,
     }
 }
 
@@ -333,7 +337,8 @@ fn status_color(s: &str) -> Color {
     match s {
         "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
         | "Established" => Color::Green,
-        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" => Color::Yellow,
+        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" => Color::Yellow,
+        "ScaledToZero" | "NoNodes" => Color::DarkGray,
         _ if s.starts_with("Init:") || s.contains("SchedulingDisabled") => Color::Yellow,
         _ => Color::Red,
     }
@@ -637,6 +642,18 @@ const NODE_HINTS: Hints = &[
 ];
 const NODE_DETAILS_HINTS: Hints =
     &[("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const WORKLOAD_HINTS: Hints = &[
+    ("Enter", "pods"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
 const GENERIC_HINTS: Hints = &[
     ("Enter", "describe"),
     ("/", "search"),
@@ -844,7 +861,7 @@ impl ListView {
 /// The pod list of one namespace: its own informer, torn down when you go back.
 struct PodLevel {
     scope: Option<String>, // namespace, or None for all namespaces
-    node: Option<String>,  // set when opened from the node list
+    filter: Option<PodFilter>, // set when opened from a node or a workload
     client: Client,
     api: Api<Pod>,
     store: Store<Pod>,
@@ -882,7 +899,7 @@ fn open_pods(
     tx: &Sender<Done>,
     activity: &mut Activity,
     scope: Option<String>,
-    node: Option<String>, // only pods scheduled on this node
+    filter: Option<PodFilter>, // only pods the filter selects
 ) -> PodLevel {
     let api: Api<Pod> = match &scope {
         Some(ns) => Api::namespaced(client.clone(), ns),
@@ -894,8 +911,14 @@ fn open_pods(
     };
     let (store, writer) = reflector::store();
     let mut config = watcher::Config::default();
-    if let Some(n) = &node {
-        config = config.fields(&format!("spec.nodeName={n}")); // filtered by the API server
+    if let Some(f) = &filter {
+        // both filters are applied by the API server
+        if let Some(fields) = &f.fields {
+            config = config.fields(fields);
+        }
+        if let Some(labels) = &f.labels {
+            config = config.labels(labels);
+        }
     }
     let stream = reflector(writer, watcher(api.clone(), config)).default_backoff().applied_objects();
     let task = rt.spawn(stream.for_each(|_| async {}));
@@ -908,8 +931,8 @@ fn open_pods(
     .default_backoff()
     .applied_objects();
     let events_task = rt.spawn(event_stream.for_each(|_| async {}));
-    let loading = activity.start(match &node {
-        Some(n) => format!("loading pods on {n}"),
+    let loading = activity.start(match &filter {
+        Some(f) => format!("loading pods of {}", f.crumbs.join("/")),
         None => format!("loading pods in {}", scope.as_deref().unwrap_or("all namespaces")),
     });
     {
@@ -959,7 +982,7 @@ fn open_pods(
             }
         })
     };
-    PodLevel { scope, node, client: client.clone(), api, store, task, loading, metrics, metrics_task, history, events, events_task }
+    PodLevel { scope, filter, client: client.clone(), api, store, task, loading, metrics, metrics_task, history, events, events_task }
 }
 
 #[tokio::main]
@@ -1388,11 +1411,20 @@ fn format_age(secs: i64) -> String {
 }
 
 /// The table for either level. Pods get READY and RESTARTS columns on top of the shared ones.
+/// What narrows a pod list: where it came from (for the breadcrumb) and the API server's selectors.
+#[derive(Clone, Debug)]
+struct PodFilter {
+    crumbs: Vec<String>,
+    fields: Option<String>, // e.g. spec.nodeName=n1
+    labels: Option<String>, // e.g. app=web
+}
+
 /// Which column set `render_list` draws; pods and nodes also carry live usage.
 enum ListKind<'a> {
     Namespaces,
     Pods(&'a MetricsState),
     Nodes(&'a MetricsState),
+    Workload(workloads::Workload),
 }
 
 fn count_text(n: Option<u64>) -> String {
@@ -1416,7 +1448,7 @@ fn render_list(
     status: &str,
 ) {
     let (pods, nodes, metrics) = match kind {
-        ListKind::Namespaces => (false, false, None),
+        ListKind::Namespaces | ListKind::Workload(_) => (false, false, None),
         ListKind::Pods(m) => (true, false, Some(m)),
         ListKind::Nodes(m) => (false, true, Some(m)),
     };
@@ -1432,7 +1464,13 @@ fn render_list(
     let status_cell = |n: &Item| Cell::from(n.status.clone()).style(Style::new().fg(status_color(&n.status)));
 
     // (title, which sort column it is, width)
-    let columns: Vec<(&str, Option<Column>, Constraint)> = if nodes {
+    let workload = if let ListKind::Workload(w) = kind { Some(w) } else { None };
+    let columns: Vec<(&str, Option<Column>, Constraint)> = if let Some(w) = workload {
+        let mut c = vec![("NAME", Some(Column::Name), Constraint::Fill(2)), ("STATUS", Some(Column::Status), Constraint::Length(14))];
+        c.extend(workloads::columns(w).into_iter().map(|(t, w)| (t, None, w)));
+        c.push(("AGE", Some(Column::Age), Constraint::Length(5)));
+        c
+    } else if nodes {
         vec![
             ("NAME", Some(Column::Name), Constraint::Fill(2)),
             ("STATUS", Some(Column::Status), Constraint::Length(22)),
@@ -1470,6 +1508,12 @@ fn render_list(
     };
     let rows = visible.iter().map(|n| {
         let age = Cell::from(format_age(now - n.created));
+        if let (Some(extra), true) = (&n.extra, workload.is_some()) {
+            let mut cells = vec![Cell::from(n.name.clone()), status_cell(n)];
+            cells.extend(extra.iter().map(|(t, c)| Cell::from(t.clone()).style(Style::new().fg(*c))));
+            cells.push(age);
+            return Row::new(cells);
+        }
         match (&n.pod, &n.node, metrics) {
             (_, Some(nc), Some(m)) => {
                 let u = m.usage.get(&n.name);
@@ -1608,8 +1652,8 @@ fn run_app(
             state.sort.resource = state::Sort::of(&g.list);
             state.resource = g.info.clone();
             state.namespace = g.scope.clone();
-        } else if let Some(p) = pods.as_ref().filter(|p| p.node.is_none()) {
-            // (a node's pod list is a detour from the node list; it is not remembered)
+        } else if let Some(p) = pods.as_ref().filter(|p| p.filter.is_none()) {
+            // (a node's or workload's pod list is a detour from its list; it is not remembered)
             state.sort.resource = state::Sort::of(&lists[1]);
             state.resource = pods_info.clone();
             state.namespace = p.scope.clone();
@@ -1689,11 +1733,10 @@ fn run_app(
 
         let mut crumbs: Vec<String> = vec!["Namespaces".into()];
         if let Some(p) = &pods {
-            match &p.node {
-                Some(n) => {
+            match &p.filter {
+                Some(f) => {
                     crumbs.truncate(1);
-                    crumbs.push("nodes".into());
-                    crumbs.push(n.clone());
+                    crumbs.extend(f.crumbs.clone());
                 }
                 None => crumbs.push(p.scope.clone().unwrap_or_else(|| "All namespaces".into())),
             }
@@ -2004,13 +2047,13 @@ fn run_app(
                     modal = Some(Modal::Drain { node, opts: drain::DrainOpts::default(), focus: 4, yes: false });
                 }
 
-                Some(generic_view::Action::NodePods(node)) => {
-                    parked = generic.take(); // keep the node list to come back to
+                Some(generic_view::Action::Pods { scope, filter }) => {
+                    parked = generic.take(); // keep the list to come back to
                     if let Some(old) = pods.take() {
                         activity.finish(old.loading);
                         lists.pop();
                     }
-                    pods = Some(open_pods(client, rt, &tx, &mut activity, None, Some(node)));
+                    pods = Some(open_pods(client, rt, &tx, &mut activity, scope, Some(filter)));
                     lists.push(ListView::sorted(state.sort.resource));
                 }
                 Some(generic_view::Action::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
@@ -2274,6 +2317,7 @@ mod tests {
             created: 0,
             labels: vec![],
             pod: None,
+            extra: None,
             node: Some(nodes::NodeCols {
                 roles: "control-plane".into(),
                 version: "v1.30.2".into(),
@@ -2305,6 +2349,27 @@ mod tests {
         term.draw(|f| render_modal(f, &modal, &[], &[])).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         for want in ["Drain n1?", "[x] Ignore DaemonSets", "[ ] Force", "[ ] Disable eviction", "[ ] Delete emptyDir data", "Yes", "No"] {
+            assert!(text.contains(want), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn workload_list_uses_the_kind_specific_columns() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let item = Item {
+            name: "web".into(),
+            status: "Available".into(),
+            created: 0,
+            labels: vec![],
+            pod: None,
+            node: None,
+            extra: Some(vec![("3/3".into(), Color::Green), ("3".into(), Color::Reset), ("3".into(), Color::Green), ("RollingUpdate".into(), Color::Reset), ("web:1".into(), Color::Reset)]),
+        };
+        let mut term = Terminal::new(TestBackend::new(140, 6)).unwrap();
+        let mut list = ListView::sorted(state::Sort::default());
+        term.draw(|f| render_list(f, f.area(), ListKind::Workload(workloads::Workload::Deployment), &[&item], 1, &mut list, "")).unwrap();
+        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        for want in ["UP-TO-DATE", "AVAILABLE", "STRATEGY", "IMAGES", "Available", "3/3", "RollingUpdate", "web:1"] {
             assert!(text.contains(want), "missing {want}");
         }
     }

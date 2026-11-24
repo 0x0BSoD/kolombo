@@ -2,7 +2,7 @@
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
 use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_HINTS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, Item, ListView, YAML_HINTS, created_secs, created_text,
+    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_HINTS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, Item, ListView, YAML_HINTS, created_secs, created_text,
     field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
 };
 use crate::resources::ResourceInfo;
@@ -22,14 +22,14 @@ use ratatui::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
-use crate::nodes;
+use crate::{nodes, workloads};
 use tokio::task::JoinHandle;
 
 /// What the main loop must do after a key.
 pub enum Action {
     Close,
     Quit,
-    NodePods(String), // Enter on a node: its pods
+    Pods { scope: Option<String>, filter: PodFilter }, // Enter on a node or workload: its pods
     Cordon(String),
     Uncordon(String),
     Drain(String), // opens the drain options popup
@@ -92,13 +92,18 @@ pub fn dyn_status(o: &DynamicObject) -> String {
 }
 
 /// `nodes` = pod counts per node name when this is the node list.
-fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>) -> Item {
+fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>, workload: Option<workloads::Workload>) -> Item {
     Item {
         name: if all { format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any()) } else { o.name_any() },
-        status: if nodes.is_some() { nodes::status(o) } else { dyn_status(o) },
+        status: match (nodes, workload) {
+            (Some(_), _) => nodes::status(o),
+            (_, Some(w)) => workloads::status(w, o),
+            _ => dyn_status(o),
+        },
         created: created_secs(&o.metadata),
         labels: labels_of(&o.metadata, false),
         pod: None,
+        extra: workload.map(|w| workloads::cells(w, o)),
         node: nodes.map(|counts| nodes::cols(o, counts.get(&o.name_any()).copied().unwrap_or(0))),
     }
 }
@@ -106,6 +111,9 @@ fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>
 fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usage>, pods: usize) -> Details {
     if nodes::is_nodes(info) {
         return Details { meta: o.metadata.clone(), info: nodes::info_rows(o, usage, pods), pod: None };
+    }
+    if let Some(w) = workloads::kind_of(info) {
+        return Details { meta: o.metadata.clone(), info: workloads::info_rows(w, o), pod: None };
     }
     let mut rows = vec![field("Kind", Span::raw(format!("{} ({})", info.kind, info.api_version())))];
     if let Some(ns) = o.namespace() {
@@ -200,7 +208,7 @@ impl GenericView {
     fn items(&self) -> Vec<Item> {
         let all = self.all();
         let counts = self.pods.as_ref().map(nodes::pod_counts).or_else(|| nodes::is_nodes(&self.info).then(HashMap::new));
-        self.store.state().iter().map(|o| dyn_item(o, all, counts.as_ref())).collect()
+        self.store.state().iter().map(|o| dyn_item(o, all, counts.as_ref(), workloads::kind_of(&self.info))).collect()
     }
 
     fn all(&self) -> bool {
@@ -231,6 +239,8 @@ impl GenericView {
             if nodes::is_nodes(&self.info) { NODE_DETAILS_HINTS } else { GENERIC_DETAILS_HINTS }
         } else if nodes::is_nodes(&self.info) {
             NODE_HINTS
+        } else if workloads::kind_of(&self.info).is_some_and(workloads::has_pods) {
+            WORKLOAD_HINTS
         } else {
             GENERIC_HINTS
         }
@@ -257,7 +267,11 @@ impl GenericView {
         let matcher = SkimMatcherV2::default();
         let visible = visible_items(&items, &self.list, &matcher);
         let snapshot = self.usage.as_ref().map(|u| u.lock().unwrap().clone());
-        let kind = snapshot.as_ref().map_or(ListKind::Namespaces, ListKind::Nodes);
+        let kind = match (snapshot.as_ref(), workloads::kind_of(&self.info)) {
+            (Some(m), _) => ListKind::Nodes(m),
+            (None, Some(w)) => ListKind::Workload(w),
+            _ => ListKind::Namespaces,
+        };
         render_list(frame, area, kind, &visible, items.len(), &mut self.list, &status);
         if self.typing {
             let popup = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
@@ -327,7 +341,20 @@ impl GenericView {
             KeyCode::Char('>') => self.list.sort_col = self.list.sort_col.step(1),
             KeyCode::Char('<') => self.list.sort_col = self.list.sort_col.step(-1),
             KeyCode::Char('A') => self.list.ascending = !self.list.ascending,
-            KeyCode::Enter if node => return selected.map(Action::NodePods),
+            KeyCode::Enter if node => {
+                return selected.map(|n| Action::Pods {
+                    scope: None,
+                    filter: PodFilter { crumbs: vec!["nodes".into(), n.clone()], fields: Some(format!("spec.nodeName={n}")), labels: None },
+                });
+            }
+            KeyCode::Enter if workloads::kind_of(&self.info).is_some_and(workloads::has_pods) => {
+                if let Some(k) = selected {
+                    match self.workload_pods(&k) {
+                        Some(action) => return Some(action),
+                        None => self.viewing = Some(k), // no usable selector: describe instead
+                    }
+                }
+            }
             KeyCode::Char('c') if node => return selected.map(Action::Cordon),
             KeyCode::Char('u') if node => return selected.map(Action::Uncordon),
             KeyCode::Char('C') if node => return selected.map(Action::Drain),
@@ -346,6 +373,16 @@ impl GenericView {
             _ => {}
         }
         None
+    }
+
+    /// The pods a workload selects: its own namespace plus its `spec.selector`.
+    fn workload_pods(&self, key: &str) -> Option<Action> {
+        let o = crate::find_in(&self.store, key)?;
+        let labels = Some(workloads::label_selector(&o)).filter(|s| !s.is_empty())?;
+        Some(Action::Pods {
+            scope: o.namespace(),
+            filter: PodFilter { crumbs: vec![self.info.name.clone(), key.to_string()], fields: None, labels: Some(labels) },
+        })
     }
 
     fn open_yaml(&mut self, key: &str) {
@@ -377,7 +414,7 @@ mod tests {
     #[test]
     fn all_namespaces_keys_carry_the_namespace() {
         let o = object(r#"{"apiVersion": "x/v1", "kind": "Thing", "metadata": {"name": "a", "namespace": "n"}}"#);
-        assert_eq!(dyn_item(&o, true, None).name, "n/a");
-        assert_eq!(dyn_item(&o, false, None).name, "a");
+        assert_eq!(dyn_item(&o, true, None, None).name, "n/a");
+        assert_eq!(dyn_item(&o, false, None, None).name, "a");
     }
 }
