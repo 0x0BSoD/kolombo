@@ -22,6 +22,7 @@ pub struct ResourceInfo {
 pub enum Target {
     Namespaces,
     Pods,
+    Dashboard,
     Generic, // any other type, through the untyped list
 }
 
@@ -30,6 +31,7 @@ impl ResourceInfo {
         match (self.group.as_str(), self.name.as_str()) {
             ("", "pods") => Target::Pods,
             ("", "namespaces") => Target::Namespaces,
+            ("", "dashboard") => Target::Dashboard,
             _ => Target::Generic,
         }
     }
@@ -58,7 +60,20 @@ pub fn builtin() -> Vec<ResourceInfo> {
         info("namespaces", "namespace", "ns", "Namespace"),
         info("nodes", "node", "no", "Node"),
         info("pods", "pod", "po", "Pod"),
+        dashboard(),
     ]
+}
+
+/// Not an API resource: the start screen, reachable through `:` like any type.
+fn dashboard() -> ResourceInfo {
+    ResourceInfo {
+        name: "dashboard".into(),
+        singular: "dashboard".into(),
+        short_names: vec!["dash".into(), "home".into()],
+        kind: "Dashboard".into(),
+        version: "v1".into(),
+        ..Default::default()
+    }
 }
 
 fn collect(list: APIResourceList, out: &mut Vec<ResourceInfo>) {
@@ -98,6 +113,9 @@ pub async fn discover(client: &Client) -> Vec<ResourceInfo> {
         for list in lists.into_iter().flatten() {
             collect(list, &mut out);
         }
+    }
+    if !out.is_empty() {
+        out.push(dashboard());
     }
     out
 }

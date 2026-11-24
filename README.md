@@ -11,6 +11,8 @@ Kolombo reads your kubeconfig the same way `kubectl` does and uses its current c
 
 ## Features
 
+- **Dashboard** as the start screen: cluster facts, CPU / memory / pod totals (used and requested),
+  ready/total for pods, deployments, statefulsets and daemonsets, and the latest events. `:dash` returns to it.
 - **Namespaces and pods**, kept live by watchers. `Enter` on a namespace opens its pods.
 - **Any resource type, CRDs included**, through `:` (see below). Pods and namespaces have dedicated
   views; everything else opens in a generic list.
@@ -63,7 +65,7 @@ Press `?` in any view for the keys of that view. The main ones:
 | `Ctrl+d` | Delete (asks first) |
 | `l` | Logs of the pod (in a container view: that container) |
 | `c` `u` `C` | Node: cordon, uncordon, drain (Shift+c opens the options) |
-| `Esc` | Back (in the namespace list: quit) |
+| `Esc` | Back (namespace list → dashboard, dashboard: quit) |
 | `q` | Quit |
 
 Log view: `1` `2` `3` show the last 1, 5 or 15 minutes, `0` shows everything (up to 20000 lines),
@@ -78,7 +80,7 @@ selection, `y` copies the selection or line, `Y` copies everything.
 Kolombo keeps its state in `$HOME/.config/kolombo/state` (YAML) and creates it on first run:
 
 ```yaml
-open: resource            # namespaces | resource
+open: dashboard           # dashboard | namespaces | resource
 resource:                 # the open type, as API discovery described it
   name: pods
   kind: Pod

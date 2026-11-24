@@ -4,11 +4,12 @@ use crate::{Column, ListView, resources::{self, ResourceInfo}};
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::{Path, PathBuf}};
 
-/// Which list was on screen.
+/// Which screen was open.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     #[default]
+    Dashboard,
     Namespaces,
     Resource,
 }

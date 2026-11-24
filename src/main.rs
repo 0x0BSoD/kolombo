@@ -1,4 +1,5 @@
 mod container_view;
+mod dashboard;
 mod drain;
 mod generic_view;
 mod log_view;
@@ -585,6 +586,8 @@ fn current_context() -> String {
 }
 
 type Hints = &'static [(&'static str, &'static str)];
+
+const DASHBOARD_HINTS: Hints = &[("j/k", "select event"), (":", "resource"), ("q", "quit")];
 
 const LIST_HINTS: Hints = &[
     ("Enter", "pods"),
@@ -1653,6 +1656,7 @@ fn run_app(
     let mut env_sel = TableState::default(); // scroll position of the container's env table
     let mut logs: Option<log_view::LogView> = None; // log pane, when open
     let mut generic: Option<generic_view::GenericView> = None; // list of any other resource type
+    let mut dashboard: Option<dashboard::Dashboard> = None; // the start screen
     let mut parked: Option<generic_view::GenericView> = None; // the node list while its pods are shown
     let pods_info = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
@@ -1662,13 +1666,15 @@ fn run_app(
     let mut saved = state.clone(); // what the file holds right now
     // Reopen where the last run stopped.
     let remembered = state.resource.clone();
-    if state.open == state::Level::Resource && !remembered.version.is_empty() && !remembered.kind.is_empty() {
+    if state.open == state::Level::Dashboard {
+        dashboard = Some(dashboard::Dashboard::open(rt, client));
+    } else if state.open == state::Level::Resource && !remembered.version.is_empty() && !remembered.kind.is_empty() {
         match remembered.target() {
             resources::Target::Pods => {
                 pods = Some(open_pods(client, rt, &tx, &mut activity, state.namespace.clone(), None));
                 lists.push(ListView::sorted(state.sort.resource));
             }
-            resources::Target::Namespaces => {}
+            resources::Target::Namespaces | resources::Target::Dashboard => {}
             resources::Target::Generic => {
                 generic = Some(open_generic(client, rt, &tx, &mut activity, remembered, state.namespace.clone(), state.sort.resource));
             }
@@ -1699,7 +1705,13 @@ fn run_app(
             state.resource = pods_info.clone();
             state.namespace = p.scope.clone();
         }
-        state.open = if generic.is_some() || pods.is_some() { state::Level::Resource } else { state::Level::Namespaces };
+        state.open = if dashboard.is_some() {
+            state::Level::Dashboard
+        } else if generic.is_some() || pods.is_some() {
+            state::Level::Resource
+        } else {
+            state::Level::Namespaces
+        };
         if state != saved {
             if let Some(path) = state_path {
                 if let Err(e) = state.save(path) {
@@ -1783,7 +1795,10 @@ fn run_app(
             }
             crumbs.push("Pods".into());
         }
-        let hints: Hints = if let Some(g) = &generic {
+        let hints: Hints = if dashboard.is_some() {
+            crumbs = vec!["Dashboard".into()];
+            DASHBOARD_HINTS
+        } else if let Some(g) = &generic {
             crumbs.truncate(1);
             crumbs.extend(g.crumbs());
             g.hints()
@@ -1825,6 +1840,8 @@ fn run_app(
                 v.render(frame, body, &status);
             } else if let Some(l) = &mut logs {
                 l.render(frame, body, &status);
+            } else if let Some(d) = &mut dashboard {
+                d.render(frame, body, info, &status);
             } else if let Some(g) = &mut generic {
                 g.render(frame, body, &status);
             } else if let Some(cd) = &cdetails {
@@ -1978,7 +1995,8 @@ fn run_app(
                                         .as_ref()
                                         .map(|g| g.scope.clone())
                                         .or_else(|| pods.as_ref().map(|p| p.scope.clone()))
-                                        .unwrap_or_else(|| selected.clone());
+                                        .unwrap_or_else(|| if dashboard.is_some() { state.namespace.clone() } else { selected.clone() });
+                                    dashboard = None;
                                     if let Some(old) = generic.take() {
                                         activity.finish(old.loading);
                                     }
@@ -1989,11 +2007,14 @@ fn run_app(
                                                 lists.push(ListView::sorted(state.sort.resource));
                                             }
                                         }
-                                        resources::Target::Namespaces => {
+                                        resources::Target::Namespaces | resources::Target::Dashboard => {
                                             parked = None;
                                             if let Some(p) = pods.take() {
                                                 activity.finish(p.loading);
                                                 lists.pop();
+                                            }
+                                            if r.target() == resources::Target::Dashboard {
+                                                dashboard = Some(dashboard::Dashboard::open(rt, client));
                                             }
                                         }
                                         resources::Target::Generic => {
@@ -2070,6 +2091,16 @@ fn run_app(
         if let Some(l) = &mut logs {
             if l.handle_key(key) {
                 logs = None;
+            }
+            continue;
+        }
+        if let Some(d) = &mut dashboard {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('j') | KeyCode::Down => d.step(1),
+                KeyCode::Char('k') | KeyCode::Up => d.step(-1),
+                KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                _ => {}
             }
             continue;
         }
@@ -2223,7 +2254,7 @@ fn run_app(
                     if in_pods {
                         go_back = true;
                     } else {
-                        return Ok(());
+                        dashboard = Some(dashboard::Dashboard::open(rt, client)); // the root screen
                     }
                 }
                 KeyCode::Esc => list.query.clear(), // first Esc drops the filter
