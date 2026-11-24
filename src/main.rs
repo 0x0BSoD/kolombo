@@ -1,3 +1,4 @@
+mod batch_panes;
 mod container_view;
 mod dashboard;
 mod drain;
@@ -339,9 +340,9 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
 fn status_color(s: &str) -> Color {
     match s {
         "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
-        | "Established" | "OK" | "Normal" | "Programmed" | "Accepted" => Color::Green,
+        | "Established" | "OK" | "Normal" | "Programmed" | "Accepted" | "Complete" => Color::Green,
         "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" | "Released" | "Degraded"
-        | "AtLimit" | "Warning" => Color::Yellow,
+        | "AtLimit" | "Warning" | "Suspended" => Color::Yellow,
         "ScaledToZero" | "NoNodes" => Color::DarkGray,
         _ if s.starts_with("Init:") || s.contains("SchedulingDisabled") => Color::Yellow,
         _ => Color::Red,

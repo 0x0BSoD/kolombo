@@ -42,6 +42,9 @@ pub enum Pane {
     Route, // HTTPRoute, GRPCRoute and the other route kinds share their shape
     ReferenceGrant,
     BackendTlsPolicy,
+    // batch/v1 (see batch_panes.rs)
+    Job,
+    CronJob,
 }
 
 impl Pane {
@@ -57,8 +60,12 @@ impl Pane {
         )
     }
 
+    fn is_batch(self) -> bool {
+        matches!(self, Pane::Job | Pane::CronJob)
+    }
+
     fn is_core(self) -> bool {
-        !self.is_apps() && !self.is_net()
+        !self.is_apps() && !self.is_net() && !self.is_batch()
     }
 }
 
@@ -69,6 +76,8 @@ pub fn kind_of(info: &ResourceInfo) -> Option<Pane> {
         ("apps", "statefulsets") => Some(Pane::StatefulSet),
         ("apps", "daemonsets") => Some(Pane::DaemonSet),
         ("apps", "controllerrevisions") => Some(Pane::ControllerRevision),
+        ("batch", "jobs") => Some(Pane::Job),
+        ("batch", "cronjobs") => Some(Pane::CronJob),
         ("", "services") => Some(Pane::Service),
         ("", "endpoints") => Some(Pane::Endpoints),
         ("", "configmaps") => Some(Pane::ConfigMap),
@@ -88,6 +97,9 @@ pub fn kind_of(info: &ResourceInfo) -> Option<Pane> {
 pub fn columns(w: Pane) -> Vec<(&'static str, Constraint)> {
     if w.is_net() {
         return crate::net_panes::columns(w);
+    }
+    if w.is_batch() {
+        return crate::batch_panes::columns(w);
     }
     if w.is_core() {
         return crate::core_panes::columns(w);
@@ -196,7 +208,7 @@ pub fn selector_string(sel: &Value) -> String {
 
 /// Whether Enter on this kind should open its pods.
 pub fn has_pods(w: Pane) -> bool {
-    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::Service | Pane::ReplicationController)
+    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::Job | Pane::Service | Pane::ReplicationController)
 }
 
 fn strategy(o: &DynamicObject, key: &str) -> String {
@@ -215,6 +227,9 @@ fn condition<'a>(o: &'a DynamicObject, kind: &str) -> Option<&'a Value> {
 pub fn status(w: Pane, o: &DynamicObject) -> String {
     if w.is_net() {
         return crate::net_panes::status(w, o);
+    }
+    if w.is_batch() {
+        return crate::batch_panes::status(w, o);
     }
     if w.is_core() {
         return crate::core_panes::status(w, o);
@@ -270,6 +285,9 @@ pub fn status(w: Pane, o: &DynamicObject) -> String {
 pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
     if w.is_net() {
         return crate::net_panes::cells(w, o);
+    }
+    if w.is_batch() {
+        return crate::batch_panes::cells(w, o);
     }
     if w.is_core() {
         return crate::core_panes::cells(w, o);
@@ -343,6 +361,9 @@ pub(crate) fn lines(label: &str, values: Vec<Vec<Span<'static>>>) -> Vec<Line<'s
 pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
     if w.is_net() {
         return crate::net_panes::info_rows(w, o);
+    }
+    if w.is_batch() {
+        return crate::batch_panes::info_rows(w, o);
     }
     if w.is_core() {
         return crate::core_panes::info_rows(w, o);

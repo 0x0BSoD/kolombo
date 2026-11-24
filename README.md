@@ -20,6 +20,7 @@ Kolombo reads your kubeconfig the same way `kubectl` does and uses its current c
   ListenerSet, HTTPRoute and the other routes, ReferenceGrant, BackendTLSPolicy). `Enter` walks down
   the hierarchy: GatewayClass → Gateway → ListenerSet → HTTPRoute → Service → Pods (`r` on a Gateway
   or ListenerSet jumps straight to its routes). `Esc` climbs back one level at a time.
+- **Jobs and CronJobs** (batch/v1): `Enter` on a CronJob lists its Jobs, on a Job its pods.
 - **Nodes** with gauges for CPU, memory and pod count, roles, version, IP and OS image.
   `Enter` shows the pods running on that node.
 - **Pod details**: containers with state and last termination, conditions, events, labels and

@@ -143,7 +143,7 @@ fn services(wanted: HashSet<(String, String)>) -> Target {
 }
 
 pub fn has_hop(w: Pane) -> bool {
-    matches!(w, Pane::IngressClass | Pane::Ingress | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route)
+    matches!(w, Pane::IngressClass | Pane::Ingress | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route | Pane::CronJob)
 }
 
 /// What Enter opens for this object: the next level down the hierarchy.
@@ -164,6 +164,11 @@ pub fn enter(w: Pane, o: &DynamicObject) -> Option<Hop> {
         Pane::ListenerSet => vec![routes_to(&["ListenerSet", "XListenerSet"], ns, name)],
         Pane::Route => vec![services(route_services(o))],
         Pane::Ingress => vec![services(ingress_services(o))],
+        Pane::CronJob => {
+            // the Jobs it created: owned by its uid
+            let uid = o.metadata.uid.clone().unwrap_or_default();
+            vec![target("batch", "jobs", move |j| j.owner_references().iter().any(|r| r.uid == uid))]
+        }
         Pane::IngressClass => vec![target("networking.k8s.io", "ingresses", move |i| {
             s(&i.data["spec"]["ingressClassName"]) == name
                 || i.annotations().get("kubernetes.io/ingress.class").is_some_and(|c| *c == name) // the pre-1.18 way
