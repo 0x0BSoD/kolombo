@@ -45,6 +45,10 @@ pub enum Pane {
     // batch/v1 (see batch_panes.rs)
     Job,
     CronJob,
+    // argoproj.io (see argo_panes.rs)
+    Application,
+    ApplicationSet,
+    AppProject,
 }
 
 impl Pane {
@@ -64,8 +68,12 @@ impl Pane {
         matches!(self, Pane::Job | Pane::CronJob)
     }
 
+    fn is_argo(self) -> bool {
+        matches!(self, Pane::Application | Pane::ApplicationSet | Pane::AppProject)
+    }
+
     fn is_core(self) -> bool {
-        !self.is_apps() && !self.is_net() && !self.is_batch()
+        !self.is_apps() && !self.is_net() && !self.is_batch() && !self.is_argo()
     }
 }
 
@@ -89,7 +97,7 @@ pub fn kind_of(info: &ResourceInfo) -> Option<Pane> {
         ("", "resourcequotas") => Some(Pane::ResourceQuota),
         ("", "limitranges") => Some(Pane::LimitRange),
         ("", "replicationcontrollers") => Some(Pane::ReplicationController),
-        _ => crate::net_panes::kind_of(info),
+        _ => crate::net_panes::kind_of(info).or_else(|| crate::argo_panes::kind_of(info)),
     }
 }
 
@@ -100,6 +108,9 @@ pub fn columns(w: Pane) -> Vec<(&'static str, Constraint)> {
     }
     if w.is_batch() {
         return crate::batch_panes::columns(w);
+    }
+    if w.is_argo() {
+        return crate::argo_panes::columns(w);
     }
     if w.is_core() {
         return crate::core_panes::columns(w);
@@ -231,6 +242,9 @@ pub fn status(w: Pane, o: &DynamicObject) -> String {
     if w.is_batch() {
         return crate::batch_panes::status(w, o);
     }
+    if w.is_argo() {
+        return crate::argo_panes::status(w, o);
+    }
     if w.is_core() {
         return crate::core_panes::status(w, o);
     }
@@ -288,6 +302,9 @@ pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
     }
     if w.is_batch() {
         return crate::batch_panes::cells(w, o);
+    }
+    if w.is_argo() {
+        return crate::argo_panes::cells(w, o);
     }
     if w.is_core() {
         return crate::core_panes::cells(w, o);
@@ -364,6 +381,9 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
     }
     if w.is_batch() {
         return crate::batch_panes::info_rows(w, o);
+    }
+    if w.is_argo() {
+        return crate::argo_panes::info_rows(w, o);
     }
     if w.is_core() {
         return crate::core_panes::info_rows(w, o);

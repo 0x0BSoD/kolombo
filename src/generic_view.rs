@@ -30,6 +30,7 @@ pub enum Action {
     Close,
     Quit,
     Pods { scope: Option<String>, filter: PodFilter }, // Enter on a node or workload: its pods
+    Tree(crate::tree_view::Source), // Enter on an Argo CD Application: its resource tree
     Open { targets: Vec<net_panes::Target>, path: Vec<String> }, // Enter on a Gateway, route...: the next list down
     Cordon(String),
     Uncordon(String),
@@ -445,6 +446,7 @@ impl GenericView {
         let path = self.path_to(key);
         Some(match hop {
             net_panes::Hop::Open(targets) => Action::Open { targets, path },
+            net_panes::Hop::Tree(src) => Action::Tree(src),
             net_panes::Hop::Pods(labels) => Action::Pods { scope: o.namespace(), filter: PodFilter { crumbs: path, fields: None, labels } },
         })
     }

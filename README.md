@@ -20,6 +20,11 @@ Kolombo reads your kubeconfig the same way `kubectl` does and uses its current c
   ListenerSet, HTTPRoute and the other routes, ReferenceGrant, BackendTLSPolicy). `Enter` walks down
   the hierarchy: GatewayClass → Gateway → ListenerSet → HTTPRoute → Service → Pods (`r` on a Gateway
   or ListenerSet jumps straight to its routes). `Esc` climbs back one level at a time.
+- **Argo CD** (Application, ApplicationSet, AppProject): `Enter` goes AppProject → ApplicationSets →
+  Applications (`r` on a project lists its Applications directly); `Enter` on an Application opens its
+  **resource tree** (managed resources, and under workloads the ReplicaSets, Jobs and Pods they own).
+- **Helm releases** (`:helm`): read from Helm's release Secrets, newest revision of each. `Enter` shows
+  the release's resource tree, `y` its user-supplied values.
 - **Jobs and CronJobs** (batch/v1): `Enter` on a CronJob lists its Jobs, on a Job its pods.
 - **Nodes** with gauges for CPU, memory and pod count, roles, version, IP and OS image.
   `Enter` shows the pods running on that node.

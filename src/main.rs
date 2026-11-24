@@ -1,8 +1,10 @@
+mod argo_panes;
 mod batch_panes;
 mod container_view;
 mod dashboard;
 mod drain;
 mod generic_view;
+mod helm;
 mod log_view;
 mod net_panes;
 mod nodes;
@@ -10,6 +12,7 @@ mod core_panes;
 mod panes;
 mod resources;
 mod state;
+mod tree_view;
 mod yaml_view;
 
 use futures::StreamExt;
@@ -589,6 +592,8 @@ fn current_context() -> String {
 
 type Hints = &'static [(&'static str, &'static str)];
 
+const TREE_HINTS: Hints = &[("j/k", "move"), ("g/G", "top/bottom"), ("Space", "fold"), (":", "resource"), ("Esc", "back"), ("q", "quit")];
+const HELM_HINTS: Hints = &[("Enter", "resource tree"), ("y", "values"), ("j/k", "move"), (":", "resource"), ("Esc", "dashboard"), ("q", "quit")];
 const DASHBOARD_HINTS: Hints = &[("j/k", "select event"), (":", "resource"), ("q", "quit")];
 
 const LIST_HINTS: Hints = &[
@@ -718,7 +723,7 @@ const HOP_HINTS: Hints = &[
 ];
 const ROUTES_HINTS_NS: Hints = &[
     ("Enter", "open next"),
-    ("r", "routes"),
+    ("r", "related"),
     ("^n", "namespace"),
     ("d", "describe"),
     ("/", "search"),
@@ -732,7 +737,7 @@ const ROUTES_HINTS_NS: Hints = &[
 ];
 const ROUTES_HINTS: Hints = &[
     ("Enter", "open next"),
-    ("r", "routes"),
+    ("r", "related"),
     ("d", "describe"),
     ("/", "search"),
     (":", "resource"),
@@ -1712,6 +1717,8 @@ fn run_app(
     let mut logs: Option<log_view::LogView> = None; // log pane, when open
     let mut generic: Option<generic_view::GenericView> = None; // list of any other resource type
     let mut dashboard: Option<dashboard::Dashboard> = None; // the start screen
+    let mut helm: Option<helm::HelmView> = None; // Helm release list
+    let mut tree: Option<tree_view::TreeView> = None; // resource tree over whatever list is below
     let mut parked: Vec<generic_view::GenericView> = Vec::new(); // the lists we came down from, nearest last
     let pods_info = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
@@ -1729,7 +1736,7 @@ fn run_app(
                 pods = Some(open_pods(client, rt, &tx, &mut activity, state.namespace.clone(), None));
                 lists.push(ListView::sorted(state.sort.resource));
             }
-            resources::Target::Namespaces | resources::Target::Dashboard => {}
+            resources::Target::Namespaces | resources::Target::Dashboard | resources::Target::Helm => {}
             resources::Target::Generic => {
                 generic = Some(open_generic(client, rt, &tx, &mut activity, remembered, state.namespace.clone(), state.sort.resource));
             }
@@ -1850,7 +1857,20 @@ fn run_app(
             }
             crumbs.push("Pods".into());
         }
-        let hints: Hints = if dashboard.is_some() {
+        let hints: Hints = if let Some(t) = &tree {
+            if helm.is_some() {
+                crumbs = vec!["Helm releases".into()];
+            } else if let Some(g) = &generic {
+                crumbs.truncate(1);
+                crumbs.extend(g.crumbs());
+            }
+            crumbs.push(t.title());
+            crumbs.push("Tree".into());
+            TREE_HINTS
+        } else if helm.is_some() {
+            crumbs = vec!["Helm releases".into()];
+            HELM_HINTS
+        } else if dashboard.is_some() {
             crumbs = vec!["Dashboard".into()];
             DASHBOARD_HINTS
         } else if let Some(g) = &generic {
@@ -1895,6 +1915,10 @@ fn run_app(
                 v.render(frame, body, &status);
             } else if let Some(l) = &mut logs {
                 l.render(frame, body, &status);
+            } else if let Some(t) = &mut tree {
+                t.render(frame, body, &status);
+            } else if let Some(h) = &mut helm {
+                h.render(frame, body, &status);
             } else if let Some(d) = &mut dashboard {
                 d.render(frame, body, info, &status);
             } else if let Some(g) = &mut generic {
@@ -2052,6 +2076,8 @@ fn run_app(
                                         .or_else(|| pods.as_ref().map(|p| p.scope.clone()))
                                         .unwrap_or_else(|| if dashboard.is_some() { state.namespace.clone() } else { selected.clone() });
                                     dashboard = None;
+                                    helm = None;
+                                    tree = None;
                                     parked.clear();
                                     if let Some(old) = generic.take() {
                                         activity.finish(old.loading);
@@ -2063,14 +2089,16 @@ fn run_app(
                                                 lists.push(ListView::sorted(state.sort.resource));
                                             }
                                         }
-                                        resources::Target::Namespaces | resources::Target::Dashboard => {
+                                        resources::Target::Namespaces | resources::Target::Dashboard | resources::Target::Helm => {
                                             parked.clear();
                                             if let Some(p) = pods.take() {
                                                 activity.finish(p.loading);
                                                 lists.pop();
                                             }
-                                            if r.target() == resources::Target::Dashboard {
-                                                dashboard = Some(dashboard::Dashboard::open(rt, client));
+                                            match r.target() {
+                                                resources::Target::Dashboard => dashboard = Some(dashboard::Dashboard::open(rt, client)),
+                                                resources::Target::Helm => helm = Some(helm::HelmView::open(rt, client)),
+                                                _ => {}
                                             }
                                         }
                                         resources::Target::Generic => {
@@ -2154,6 +2182,35 @@ fn run_app(
             }
             continue;
         }
+        if let Some(t) = &mut tree {
+            match t.handle_key(key) {
+                Some(tree_view::Act::Close) => tree = None,
+                Some(tree_view::Act::Quit) => return Ok(()),
+                Some(tree_view::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                None => {}
+            }
+            continue;
+        }
+        if let Some(h) = &mut helm {
+            match h.handle_key(key) {
+                Some(helm::Act::Close) => {
+                    helm = None;
+                    dashboard = Some(dashboard::Dashboard::open(rt, client));
+                }
+                Some(helm::Act::Quit) => return Ok(()),
+                Some(helm::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                Some(helm::Act::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
+                Some(helm::Act::Values(name, json)) => {
+                    let empty = json.as_object().is_none_or(|m| m.is_empty());
+                    match serde_yaml_ng::to_value(&json) {
+                        Ok(v) if !empty => yaml = Some(YamlView::new(name, v)),
+                        _ => message = "no user-supplied values (chart defaults only)".into(),
+                    }
+                }
+                None => {}
+            }
+            continue;
+        }
         if let Some(d) = &mut dashboard {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
@@ -2188,6 +2245,7 @@ fn run_app(
                     }
                 }
                 Some(generic_view::Action::Quit) => return Ok(()),
+                Some(generic_view::Action::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
                 Some(generic_view::Action::Cordon(node)) => {
                     let (client, label) = (client.clone(), format!("cordoning {node}"));
                     spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, true).await });

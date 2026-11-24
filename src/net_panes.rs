@@ -125,9 +125,11 @@ pub enum Hop {
     Open(Vec<Target>),
     /// The pods in the object's namespace matching this selector (None = all of them).
     Pods(Option<String>),
+    /// The resource tree of an Argo CD Application or Helm release.
+    Tree(crate::tree_view::Source),
 }
 
-fn target(group: &'static str, plural: &'static str, keep: impl Fn(&DynamicObject) -> bool + Send + Sync + 'static) -> Target {
+pub(crate) fn target(group: &'static str, plural: &'static str, keep: impl Fn(&DynamicObject) -> bool + Send + Sync + 'static) -> Target {
     Target { group, plural, keep: Arc::new(keep) }
 }
 
@@ -143,11 +145,14 @@ fn services(wanted: HashSet<(String, String)>) -> Target {
 }
 
 pub fn has_hop(w: Pane) -> bool {
-    matches!(w, Pane::IngressClass | Pane::Ingress | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route | Pane::CronJob)
+    matches!(w, Pane::IngressClass | Pane::Ingress | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route | Pane::CronJob) || crate::argo_panes::has_hop(w)
 }
 
 /// What Enter opens for this object: the next level down the hierarchy.
 pub fn enter(w: Pane, o: &DynamicObject) -> Option<Hop> {
+    if crate::argo_panes::has_hop(w) {
+        return crate::argo_panes::enter(w, o);
+    }
     let (ns, name) = (o.namespace().unwrap_or_default(), o.name_any());
     Some(Hop::Open(match w {
         Pane::GatewayClass => vec![target(GATEWAY_GROUP, "gateways", move |g| s(&g.data["spec"]["gatewayClassName"]) == name)],
@@ -182,6 +187,9 @@ pub fn enter(w: Pane, o: &DynamicObject) -> Option<Hop> {
 
 /// `r` on a Gateway or ListenerSet: the routes attached to it directly (Enter may go to ListenerSets first).
 pub fn routes(w: Pane, o: &DynamicObject) -> Option<Hop> {
+    if w == Pane::AppProject {
+        return crate::argo_panes::related(w, o);
+    }
     let (ns, name) = (o.namespace().unwrap_or_default(), o.name_any());
     match w {
         Pane::Gateway => Some(Hop::Open(vec![routes_to(&["Gateway"], ns, name)])),
@@ -191,7 +199,7 @@ pub fn routes(w: Pane, o: &DynamicObject) -> Option<Hop> {
 }
 
 pub fn has_routes(w: Pane) -> bool {
-    matches!(w, Pane::Gateway | Pane::ListenerSet)
+    matches!(w, Pane::Gateway | Pane::ListenerSet | Pane::AppProject)
 }
 
 // ---------- list ----------

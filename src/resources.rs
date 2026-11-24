@@ -23,6 +23,7 @@ pub enum Target {
     Namespaces,
     Pods,
     Dashboard,
+    Helm,
     Generic, // any other type, through the untyped list
 }
 
@@ -32,6 +33,7 @@ impl ResourceInfo {
             ("", "pods") => Target::Pods,
             ("", "namespaces") => Target::Namespaces,
             ("", "dashboard") => Target::Dashboard,
+            ("", "helmreleases") => Target::Helm,
             _ => Target::Generic,
         }
     }
@@ -61,7 +63,20 @@ pub fn builtin() -> Vec<ResourceInfo> {
         info("nodes", "node", "no", "Node"),
         info("pods", "pod", "po", "Pod"),
         dashboard(),
+        helm(),
     ]
+}
+
+/// Not an API resource either: releases are read from Helm's Secrets.
+fn helm() -> ResourceInfo {
+    ResourceInfo {
+        name: "helmreleases".into(),
+        singular: "helmrelease".into(),
+        short_names: vec!["helm".into(), "hr".into(), "releases".into()],
+        kind: "HelmRelease".into(),
+        version: "v1".into(),
+        ..Default::default()
+    }
 }
 
 /// Not an API resource: the start screen, reachable through `:` like any type.
@@ -116,6 +131,7 @@ pub async fn discover(client: &Client) -> Vec<ResourceInfo> {
     }
     if !out.is_empty() {
         out.push(dashboard());
+        out.push(helm());
     }
     out
 }
