@@ -1,5 +1,5 @@
-//! apps/v1 workloads (Deployment, ReplicaSet, StatefulSet, DaemonSet, ControllerRevision) read from
-//! untyped objects: the list columns, a status word, and the rows of the describe view.
+//! Per-kind list columns, status word and describe rows for the types that are read as untyped
+//! objects: apps/v1 workloads here, the core/v1 ones in `core_panes`.
 
 use crate::{created_text, field, short_image, status_span};
 use k8s_openapi::serde_json::Value;
@@ -13,37 +13,67 @@ use ratatui::{
 use crate::resources::ResourceInfo;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Workload {
+pub enum Pane {
+    // apps/v1
     Deployment,
     ReplicaSet,
     StatefulSet,
     DaemonSet,
     ControllerRevision,
+    // core/v1 (see core_panes.rs)
+    Service,
+    Endpoints,
+    ConfigMap,
+    Secret,
+    Pvc,
+    Pv,
+    ServiceAccount,
+    Event,
+    ResourceQuota,
+    LimitRange,
+    ReplicationController,
 }
 
-pub fn kind_of(info: &ResourceInfo) -> Option<Workload> {
-    if info.group != "apps" {
-        return None;
+impl Pane {
+    fn is_core(self) -> bool {
+        !matches!(self, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::ControllerRevision)
     }
-    match info.name.as_str() {
-        "deployments" => Some(Workload::Deployment),
-        "replicasets" => Some(Workload::ReplicaSet),
-        "statefulsets" => Some(Workload::StatefulSet),
-        "daemonsets" => Some(Workload::DaemonSet),
-        "controllerrevisions" => Some(Workload::ControllerRevision),
+}
+
+pub fn kind_of(info: &ResourceInfo) -> Option<Pane> {
+    match (info.group.as_str(), info.name.as_str()) {
+        ("apps", "deployments") => Some(Pane::Deployment),
+        ("apps", "replicasets") => Some(Pane::ReplicaSet),
+        ("apps", "statefulsets") => Some(Pane::StatefulSet),
+        ("apps", "daemonsets") => Some(Pane::DaemonSet),
+        ("apps", "controllerrevisions") => Some(Pane::ControllerRevision),
+        ("", "services") => Some(Pane::Service),
+        ("", "endpoints") => Some(Pane::Endpoints),
+        ("", "configmaps") => Some(Pane::ConfigMap),
+        ("", "secrets") => Some(Pane::Secret),
+        ("", "persistentvolumeclaims") => Some(Pane::Pvc),
+        ("", "persistentvolumes") => Some(Pane::Pv),
+        ("", "serviceaccounts") => Some(Pane::ServiceAccount),
+        ("", "events") => Some(Pane::Event),
+        ("", "resourcequotas") => Some(Pane::ResourceQuota),
+        ("", "limitranges") => Some(Pane::LimitRange),
+        ("", "replicationcontrollers") => Some(Pane::ReplicationController),
         _ => None,
     }
 }
 
 /// Columns between STATUS and AGE (NAME, STATUS and AGE are the same everywhere).
-pub fn columns(w: Workload) -> Vec<(&'static str, Constraint)> {
+pub fn columns(w: Pane) -> Vec<(&'static str, Constraint)> {
+    if w.is_core() {
+        return crate::core_panes::columns(w);
+    }
     let n = |t, w| (t, Constraint::Length(w));
     let images = ("IMAGES", Constraint::Fill(2));
     match w {
-        Workload::Deployment => vec![n("READY", 7), n("UP-TO-DATE", 10), n("AVAILABLE", 9), n("STRATEGY", 14), images],
-        Workload::ReplicaSet => vec![n("READY", 7), n("DESIRED", 7), n("OWNER", 28), images],
-        Workload::StatefulSet => vec![n("READY", 7), n("UP-TO-DATE", 10), n("STRATEGY", 14), ("SERVICE", Constraint::Fill(1)), images],
-        Workload::DaemonSet => vec![
+        Pane::Deployment => vec![n("READY", 7), n("UP-TO-DATE", 10), n("AVAILABLE", 9), n("STRATEGY", 14), images],
+        Pane::ReplicaSet => vec![n("READY", 7), n("DESIRED", 7), n("OWNER", 28), images],
+        Pane::StatefulSet => vec![n("READY", 7), n("UP-TO-DATE", 10), n("STRATEGY", 14), ("SERVICE", Constraint::Fill(1)), images],
+        Pane::DaemonSet => vec![
             n("DESIRED", 7),
             n("CURRENT", 7),
             n("READY", 7),
@@ -52,15 +82,16 @@ pub fn columns(w: Workload) -> Vec<(&'static str, Constraint)> {
             ("NODE SELECTOR", Constraint::Fill(1)),
             images,
         ],
-        Workload::ControllerRevision => vec![n("REVISION", 8), ("CONTROLLER", Constraint::Fill(2))],
+        Pane::ControllerRevision => vec![n("REVISION", 8), ("CONTROLLER", Constraint::Fill(2))],
+        _ => vec![], // core kinds returned above
     }
 }
 
-fn num(v: &Value) -> u64 {
+pub(crate) fn num(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
 
-fn text(v: &Value) -> String {
+pub(crate) fn text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
@@ -68,13 +99,13 @@ fn text(v: &Value) -> String {
     }
 }
 
-fn desired(o: &DynamicObject) -> u64 {
+pub(crate) fn desired(o: &DynamicObject) -> u64 {
     // the API server defaults a missing spec.replicas to 1
     o.data["spec"]["replicas"].as_u64().unwrap_or(1)
 }
 
 /// Green when everything is up, yellow when partly, grey when nothing is wanted, red when nothing runs.
-fn ratio(ready: u64, want: u64) -> Color {
+pub(crate) fn ratio(ready: u64, want: u64) -> Color {
     match (ready, want) {
         (_, 0) => Color::DarkGray,
         (r, w) if r >= w => Color::Green,
@@ -83,7 +114,7 @@ fn ratio(ready: u64, want: u64) -> Color {
     }
 }
 
-fn pod_containers(o: &DynamicObject) -> Vec<(String, String)> {
+pub(crate) fn pod_containers(o: &DynamicObject) -> Vec<(String, String)> {
     o.data["spec"]["template"]["spec"]["containers"]
         .as_array()
         .into_iter()
@@ -93,7 +124,7 @@ fn pod_containers(o: &DynamicObject) -> Vec<(String, String)> {
 }
 
 /// `nginx:1.25` or `nginx:1.25 +2`
-fn images(o: &DynamicObject) -> String {
+pub(crate) fn images(o: &DynamicObject) -> String {
     let all = pod_containers(o);
     match all.split_first() {
         None => String::new(),
@@ -114,9 +145,12 @@ fn selector(o: &DynamicObject) -> String {
 }
 
 /// `spec.selector` as a label-selector string for the API (`app=web,tier in (a,b),!canary`).
+/// Workloads use `matchLabels`/`matchExpressions`; Services and ReplicationControllers use a plain map.
 pub fn label_selector(o: &DynamicObject) -> String {
     let sel = &o.data["spec"]["selector"];
-    let mut parts: Vec<String> = sel["matchLabels"].as_object().into_iter().flatten().map(|(k, v)| format!("{k}={}", text(v))).collect();
+    let structured = sel.get("matchLabels").is_some() || sel.get("matchExpressions").is_some();
+    let labels = if structured { &sel["matchLabels"] } else { sel };
+    let mut parts: Vec<String> = labels.as_object().into_iter().flatten().map(|(k, v)| format!("{k}={}", text(v))).collect();
     for e in sel["matchExpressions"].as_array().into_iter().flatten() {
         let key = text(&e["key"]);
         let values = e["values"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join(",");
@@ -132,15 +166,15 @@ pub fn label_selector(o: &DynamicObject) -> String {
 }
 
 /// Whether Enter on this kind should open its pods.
-pub fn has_pods(w: Workload) -> bool {
-    w != Workload::ControllerRevision
+pub fn has_pods(w: Pane) -> bool {
+    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::Service | Pane::ReplicationController)
 }
 
 fn strategy(o: &DynamicObject, key: &str) -> String {
     text(&o.data["spec"][key]["type"])
 }
 
-fn owner(o: &DynamicObject) -> String {
+pub(crate) fn owner(o: &DynamicObject) -> String {
     o.owner_references().first().map(|r| format!("{}/{}", r.kind.to_lowercase(), r.name)).unwrap_or_default()
 }
 
@@ -149,11 +183,14 @@ fn condition<'a>(o: &'a DynamicObject, kind: &str) -> Option<&'a Value> {
 }
 
 /// One word for the STATUS column.
-pub fn status(w: Workload, o: &DynamicObject) -> String {
+pub fn status(w: Pane, o: &DynamicObject) -> String {
+    if w.is_core() {
+        return crate::core_panes::status(w, o);
+    }
     let (spec, st) = (&o.data["spec"], &o.data["status"]);
     let want = desired(o);
     match w {
-        Workload::Deployment => {
+        Pane::Deployment => {
             if spec["paused"].as_bool() == Some(true) {
                 "Paused".into()
             } else if condition(o, "ReplicaFailure").is_some_and(|c| c["status"] == "True") {
@@ -170,11 +207,11 @@ pub fn status(w: Workload, o: &DynamicObject) -> String {
                 "Unavailable".into()
             }
         }
-        Workload::ReplicaSet | Workload::StatefulSet => {
+        Pane::ReplicaSet | Pane::StatefulSet => {
             let ready = num(&st["readyReplicas"]);
             if want == 0 {
                 "ScaledToZero".into()
-            } else if w == Workload::StatefulSet && num(&st["updatedReplicas"]) < want && ready >= want {
+            } else if w == Pane::StatefulSet && num(&st["updatedReplicas"]) < want && ready >= want {
                 "Updating".into()
             } else if ready >= want {
                 "Ready".into()
@@ -182,7 +219,7 @@ pub fn status(w: Workload, o: &DynamicObject) -> String {
                 "NotReady".into()
             }
         }
-        Workload::DaemonSet => {
+        Pane::DaemonSet => {
             let want = num(&st["desiredNumberScheduled"]);
             if want == 0 {
                 "NoNodes".into()
@@ -192,20 +229,24 @@ pub fn status(w: Workload, o: &DynamicObject) -> String {
                 "NotReady".into()
             }
         }
-        Workload::ControllerRevision => String::new(),
+        Pane::ControllerRevision => String::new(),
+        _ => String::new(),
     }
 }
 
 /// Text and color for each of `columns(w)`.
-pub fn cells(w: Workload, o: &DynamicObject) -> Vec<(String, Color)> {
+pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
+    if w.is_core() {
+        return crate::core_panes::cells(w, o);
+    }
     let (spec, st) = (&o.data["spec"], &o.data["status"]);
     let plain = |s: String| (s, Color::Reset);
     let count = |v: &Value| (num(v).to_string(), Color::Reset);
     match w {
-        Workload::Deployment | Workload::StatefulSet => {
+        Pane::Deployment | Pane::StatefulSet => {
             let (want, ready) = (desired(o), num(&st["readyReplicas"]));
             let mut v = vec![(format!("{ready}/{want}"), ratio(ready, want)), count(&st["updatedReplicas"])];
-            if w == Workload::Deployment {
+            if w == Pane::Deployment {
                 let available = num(&st["availableReplicas"]);
                 v.push((available.to_string(), ratio(available, want)));
                 v.push(plain(strategy(o, "strategy")));
@@ -216,11 +257,11 @@ pub fn cells(w: Workload, o: &DynamicObject) -> Vec<(String, Color)> {
             v.push(plain(images(o)));
             v
         }
-        Workload::ReplicaSet => {
+        Pane::ReplicaSet => {
             let (want, ready) = (desired(o), num(&st["readyReplicas"]));
             vec![(format!("{ready}/{want}"), ratio(ready, want)), (want.to_string(), Color::Reset), plain(owner(o)), plain(images(o))]
         }
-        Workload::DaemonSet => {
+        Pane::DaemonSet => {
             let want = num(&st["desiredNumberScheduled"]);
             let (ready, available) = (num(&st["numberReady"]), num(&st["numberAvailable"]));
             let selector = spec["template"]["spec"]["nodeSelector"]
@@ -240,16 +281,17 @@ pub fn cells(w: Workload, o: &DynamicObject) -> Vec<(String, Color)> {
                 plain(images(o)),
             ]
         }
-        Workload::ControllerRevision => vec![plain(text(&o.data["revision"])), plain(owner(o))],
+        Pane::ControllerRevision => vec![plain(text(&o.data["revision"])), plain(owner(o))],
+        _ => vec![],
     }
 }
 
-fn mark(ok: bool) -> Span<'static> {
+pub(crate) fn mark(ok: bool) -> Span<'static> {
     if ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) }
 }
 
 /// A label on the first line only, so multi-line values stay aligned.
-fn lines(label: &str, values: Vec<Vec<Span<'static>>>) -> Vec<Line<'static>> {
+pub(crate) fn lines(label: &str, values: Vec<Vec<Span<'static>>>) -> Vec<Line<'static>> {
     values
         .into_iter()
         .enumerate()
@@ -263,7 +305,10 @@ fn lines(label: &str, values: Vec<Vec<Span<'static>>>) -> Vec<Line<'static>> {
 }
 
 /// Rows of the describe view: what the controller wants, what it has, how it rolls, what it runs.
-pub fn info_rows(w: Workload, o: &DynamicObject) -> Vec<Line<'static>> {
+pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
+    if w.is_core() {
+        return crate::core_panes::info_rows(w, o);
+    }
     let (spec, st) = (&o.data["spec"], &o.data["status"]);
     let dim = Style::new().fg(Color::DarkGray);
     let mut rows = Vec::new();
@@ -273,7 +318,7 @@ pub fn info_rows(w: Workload, o: &DynamicObject) -> Vec<Line<'static>> {
     }
     let counts = |pairs: &[(&str, u64)]| pairs.iter().map(|(k, v)| format!("{v} {k}")).collect::<Vec<_>>().join(" · ");
     match w {
-        Workload::Deployment => {
+        Pane::Deployment => {
             rows.push(field(
                 "Replicas",
                 Span::raw(counts(&[
@@ -305,14 +350,14 @@ pub fn info_rows(w: Workload, o: &DynamicObject) -> Vec<Line<'static>> {
                 ),
             ));
         }
-        Workload::ReplicaSet => {
+        Pane::ReplicaSet => {
             rows.push(field("Replicas", Span::raw(counts(&[("desired", desired(o)), ("current", num(&st["replicas"])), ("ready", num(&st["readyReplicas"])), ("available", num(&st["availableReplicas"]))]))));
             rows.push(field("Owner", Span::raw(owner(o))));
             if let Some(rev) = o.annotations().get("deployment.kubernetes.io/revision") {
                 rows.push(field("Revision", Span::raw(rev.clone())));
             }
         }
-        Workload::StatefulSet => {
+        Pane::StatefulSet => {
             rows.push(field("Replicas", Span::raw(counts(&[("desired", desired(o)), ("current", num(&st["currentReplicas"])), ("updated", num(&st["updatedReplicas"])), ("ready", num(&st["readyReplicas"]))]))));
             rows.push(field("Strategy", Span::raw(strategy(o, "updateStrategy"))));
             rows.push(field("Pods", Span::raw(format!("{} start/stop order", text(&spec["podManagementPolicy"])))));
@@ -325,7 +370,7 @@ pub fn info_rows(w: Workload, o: &DynamicObject) -> Vec<Line<'static>> {
                 .collect();
             rows.push(field("Storage", if claims.is_empty() { Span::styled("<none>", dim) } else { Span::raw(claims.join(", ")) }));
         }
-        Workload::DaemonSet => {
+        Pane::DaemonSet => {
             rows.push(field(
                 "Nodes",
                 Span::raw(counts(&[
@@ -339,12 +384,13 @@ pub fn info_rows(w: Workload, o: &DynamicObject) -> Vec<Line<'static>> {
             ));
             rows.push(field("Strategy", Span::raw(strategy(o, "updateStrategy"))));
         }
-        Workload::ControllerRevision => {
+        Pane::ControllerRevision => {
             rows.push(field("Revision", Span::raw(text(&o.data["revision"]))));
             rows.push(field("Controller", Span::raw(owner(o))));
         }
+        _ => {}
     }
-    if w != Workload::ControllerRevision {
+    if w != Pane::ControllerRevision {
         rows.push(field("Selector", Span::raw(selector(o))));
         let containers = pod_containers(o);
         let imgs = containers.iter().map(|(n, i)| vec![Span::styled(format!("{n}  "), dim), Span::raw(i.clone())]).collect();
@@ -374,7 +420,7 @@ mod tests {
         serde_yaml_ng::from_str(json).unwrap()
     }
 
-    fn cell_text(w: Workload, o: &DynamicObject) -> Vec<String> {
+    fn cell_text(w: Pane, o: &DynamicObject) -> Vec<String> {
         cells(w, o).into_iter().map(|(t, _)| t).collect()
     }
 
@@ -386,16 +432,16 @@ mod tests {
                      "template": {"spec": {"containers": [{"name": "a", "image": "reg.io/team/web:1"}, {"name": "b", "image": "envoy:1"}]}}},
             "status": {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 3, "availableReplicas": 2,
                        "conditions": [{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"}]}}"#);
-        assert_eq!(cell_text(Workload::Deployment, &d), ["2/3", "3", "2", "RollingUpdate", "team/web:1 +1"]);
-        assert_eq!(columns(Workload::Deployment).len(), cells(Workload::Deployment, &d).len());
-        assert_eq!(status(Workload::Deployment, &d), "Unavailable"); // 2 of 3 available
-        let text: String = info_rows(Workload::Deployment, &d).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert_eq!(cell_text(Pane::Deployment, &d), ["2/3", "3", "2", "RollingUpdate", "team/web:1 +1"]);
+        assert_eq!(columns(Pane::Deployment).len(), cells(Pane::Deployment, &d).len());
+        assert_eq!(status(Pane::Deployment, &d), "Unavailable"); // 2 of 3 available
+        let text: String = info_rows(Pane::Deployment, &d).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("maxSurge 25%, maxUnavailable 1") && text.contains("app=web") && text.contains("MinimumReplicasAvailable"));
 
         let scaled = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 0}}"#);
-        assert_eq!(status(Workload::Deployment, &scaled), "ScaledToZero");
+        assert_eq!(status(Pane::Deployment, &scaled), "ScaledToZero");
         let rolling = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 3}, "status": {"replicas": 4, "updatedReplicas": 1, "availableReplicas": 3}}"#);
-        assert_eq!(status(Workload::Deployment, &rolling), "Updating");
+        assert_eq!(status(Pane::Deployment, &rolling), "Updating");
     }
 
     #[test]
@@ -410,7 +456,7 @@ mod tests {
     #[test]
     fn every_kind_has_one_cell_per_column() {
         let o = obj(r#"{"apiVersion": "apps/v1", "kind": "X", "metadata": {"name": "x"}}"#);
-        for w in [Workload::Deployment, Workload::ReplicaSet, Workload::StatefulSet, Workload::DaemonSet, Workload::ControllerRevision] {
+        for w in [Pane::Deployment, Pane::ReplicaSet, Pane::StatefulSet, Pane::DaemonSet, Pane::ControllerRevision] {
             assert_eq!(columns(w).len(), cells(w, &o).len(), "{w:?}");
             assert!(!info_rows(w, &o).is_empty());
         }
@@ -420,11 +466,11 @@ mod tests {
     fn daemonset_and_replicaset_status() {
         let ds = obj(r#"{"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": "d"},
             "status": {"desiredNumberScheduled": 5, "currentNumberScheduled": 5, "numberReady": 4, "updatedNumberScheduled": 5, "numberAvailable": 4}}"#);
-        assert_eq!(status(Workload::DaemonSet, &ds), "NotReady");
-        assert_eq!(cell_text(Workload::DaemonSet, &ds)[..5], ["5", "5", "4", "5", "4"]);
+        assert_eq!(status(Pane::DaemonSet, &ds), "NotReady");
+        assert_eq!(cell_text(Pane::DaemonSet, &ds)[..5], ["5", "5", "4", "5", "4"]);
         let rs = obj(r#"{"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {"name": "r", "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "web", "uid": "u", "controller": true}]},
             "spec": {"replicas": 0}}"#);
-        assert_eq!(status(Workload::ReplicaSet, &rs), "ScaledToZero");
-        assert_eq!(cell_text(Workload::ReplicaSet, &rs)[2], "deployment/web");
+        assert_eq!(status(Pane::ReplicaSet, &rs), "ScaledToZero");
+        assert_eq!(cell_text(Pane::ReplicaSet, &rs)[2], "deployment/web");
     }
 }

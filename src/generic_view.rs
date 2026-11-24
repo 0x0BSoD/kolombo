@@ -2,7 +2,7 @@
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
 use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_HINTS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, Item, ListView, YAML_HINTS, created_secs, created_text,
+    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
     field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
 };
 use crate::resources::ResourceInfo;
@@ -22,7 +22,7 @@ use ratatui::{
 };
 use k8s_openapi::api::core::v1::Pod;
 use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
-use crate::{nodes, workloads};
+use crate::{nodes, panes};
 use tokio::task::JoinHandle;
 
 /// What the main loop must do after a key.
@@ -34,6 +34,7 @@ pub enum Action {
     Uncordon(String),
     Drain(String), // opens the drain options popup
     Command, // open the `:` picker
+    PickNamespace, // open the namespace picker
     Copy(String),
     Delete(String), // list key
     Edit(String),
@@ -92,18 +93,18 @@ pub fn dyn_status(o: &DynamicObject) -> String {
 }
 
 /// `nodes` = pod counts per node name when this is the node list.
-fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>, workload: Option<workloads::Workload>) -> Item {
+fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>, workload: Option<panes::Pane>) -> Item {
     Item {
         name: if all { format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any()) } else { o.name_any() },
         status: match (nodes, workload) {
             (Some(_), _) => nodes::status(o),
-            (_, Some(w)) => workloads::status(w, o),
+            (_, Some(w)) => panes::status(w, o),
             _ => dyn_status(o),
         },
         created: created_secs(&o.metadata),
         labels: labels_of(&o.metadata, false),
         pod: None,
-        extra: workload.map(|w| workloads::cells(w, o)),
+        extra: workload.map(|w| panes::cells(w, o)),
         node: nodes.map(|counts| nodes::cols(o, counts.get(&o.name_any()).copied().unwrap_or(0))),
     }
 }
@@ -112,8 +113,12 @@ fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usag
     if nodes::is_nodes(info) {
         return Details { meta: o.metadata.clone(), info: nodes::info_rows(o, usage, pods), pod: None };
     }
-    if let Some(w) = workloads::kind_of(info) {
-        return Details { meta: o.metadata.clone(), info: workloads::info_rows(w, o), pod: None };
+    if let Some(w) = panes::kind_of(info) {
+        let mut rows = panes::info_rows(w, o);
+        if let Some(ns) = o.namespace() {
+            rows.insert(0, field("Namespace", Span::raw(ns)));
+        }
+        return Details { meta: o.metadata.clone(), info: rows, pod: None };
     }
     let mut rows = vec![field("Kind", Span::raw(format!("{} ({})", info.kind, info.api_version())))];
     if let Some(ns) = o.namespace() {
@@ -208,7 +213,7 @@ impl GenericView {
     fn items(&self) -> Vec<Item> {
         let all = self.all();
         let counts = self.pods.as_ref().map(nodes::pod_counts).or_else(|| nodes::is_nodes(&self.info).then(HashMap::new));
-        self.store.state().iter().map(|o| dyn_item(o, all, counts.as_ref(), workloads::kind_of(&self.info))).collect()
+        self.store.state().iter().map(|o| dyn_item(o, all, counts.as_ref(), panes::kind_of(&self.info))).collect()
     }
 
     fn all(&self) -> bool {
@@ -236,11 +241,19 @@ impl GenericView {
         if self.yaml.is_some() {
             YAML_HINTS
         } else if self.viewing.is_some() {
-            if nodes::is_nodes(&self.info) { NODE_DETAILS_HINTS } else { GENERIC_DETAILS_HINTS }
+            if nodes::is_nodes(&self.info) {
+                NODE_DETAILS_HINTS
+            } else if self.info.namespaced {
+                GENERIC_DETAILS_HINTS_NS
+            } else {
+                GENERIC_DETAILS_HINTS
+            }
         } else if nodes::is_nodes(&self.info) {
             NODE_HINTS
-        } else if workloads::kind_of(&self.info).is_some_and(workloads::has_pods) {
-            WORKLOAD_HINTS
+        } else if panes::kind_of(&self.info).is_some_and(panes::has_pods) {
+            if self.info.namespaced { WORKLOAD_HINTS_NS } else { WORKLOAD_HINTS }
+        } else if self.info.namespaced {
+            GENERIC_HINTS_NS
         } else {
             GENERIC_HINTS
         }
@@ -267,9 +280,9 @@ impl GenericView {
         let matcher = SkimMatcherV2::default();
         let visible = visible_items(&items, &self.list, &matcher);
         let snapshot = self.usage.as_ref().map(|u| u.lock().unwrap().clone());
-        let kind = match (snapshot.as_ref(), workloads::kind_of(&self.info)) {
+        let kind = match (snapshot.as_ref(), panes::kind_of(&self.info)) {
             (Some(m), _) => ListKind::Nodes(m),
-            (None, Some(w)) => ListKind::Workload(w),
+            (None, Some(w)) => ListKind::Pane(w),
             _ => ListKind::Namespaces,
         };
         render_list(frame, area, kind, &visible, items.len(), &mut self.list, &status);
@@ -305,6 +318,7 @@ impl GenericView {
                 KeyCode::Char('d') if ctrl => return Some(Action::Delete(k)),
                 KeyCode::Char('e') => return Some(Action::Edit(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
+                KeyCode::Char('n') if ctrl && self.info.namespaced => return Some(Action::PickNamespace),
                 KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
                 KeyCode::Char('u') if node => return Some(Action::Uncordon(k)),
                 KeyCode::Char('C') if node => return Some(Action::Drain(k)),
@@ -336,6 +350,7 @@ impl GenericView {
         let selected = self.selected();
         match key.code {
             KeyCode::Char('d') if ctrl => return selected.map(Action::Delete),
+            KeyCode::Char('n') if ctrl && self.info.namespaced => return Some(Action::PickNamespace),
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char(':') => return Some(Action::Command),
             KeyCode::Char('>') => self.list.sort_col = self.list.sort_col.step(1),
@@ -347,7 +362,7 @@ impl GenericView {
                     filter: PodFilter { crumbs: vec!["nodes".into(), n.clone()], fields: Some(format!("spec.nodeName={n}")), labels: None },
                 });
             }
-            KeyCode::Enter if workloads::kind_of(&self.info).is_some_and(workloads::has_pods) => {
+            KeyCode::Enter if panes::kind_of(&self.info).is_some_and(panes::has_pods) => {
                 if let Some(k) = selected {
                     match self.workload_pods(&k) {
                         Some(action) => return Some(action),
@@ -378,7 +393,7 @@ impl GenericView {
     /// The pods a workload selects: its own namespace plus its `spec.selector`.
     fn workload_pods(&self, key: &str) -> Option<Action> {
         let o = crate::find_in(&self.store, key)?;
-        let labels = Some(workloads::label_selector(&o)).filter(|s| !s.is_empty())?;
+        let labels = Some(panes::label_selector(&o)).filter(|s| !s.is_empty())?;
         Some(Action::Pods {
             scope: o.namespace(),
             filter: PodFilter { crumbs: vec![self.info.name.clone(), key.to_string()], fields: None, labels: Some(labels) },

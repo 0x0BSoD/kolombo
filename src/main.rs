@@ -3,7 +3,8 @@ mod drain;
 mod generic_view;
 mod log_view;
 mod nodes;
-mod workloads;
+mod core_panes;
+mod panes;
 mod resources;
 mod state;
 mod yaml_view;
@@ -64,7 +65,7 @@ struct Item {
     labels: Vec<(String, String)>, // user labels only, sorted by key
     pod: Option<PodCols>,          // pod-only columns; None for namespaces
     node: Option<nodes::NodeCols>, // node-only columns
-    extra: Option<Vec<(String, Color)>>, // workload columns, in the order of `workloads::columns`
+    extra: Option<Vec<(String, Color)>>, // workload columns, in the order of `panes::columns`
 }
 
 /// True for `kubernetes.io/...` and `*.kubernetes.io/...` keys (system-managed).
@@ -336,8 +337,9 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
 fn status_color(s: &str) -> Color {
     match s {
         "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
-        | "Established" => Color::Green,
-        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" => Color::Yellow,
+        | "Established" | "OK" | "Normal" => Color::Green,
+        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" | "Released" | "Degraded"
+        | "AtLimit" | "Warning" => Color::Yellow,
         "ScaledToZero" | "NoNodes" => Color::DarkGray,
         _ if s.starts_with("Init:") || s.contains("SchedulingDisabled") => Color::Yellow,
         _ => Color::Red,
@@ -642,6 +644,35 @@ const NODE_HINTS: Hints = &[
 ];
 const NODE_DETAILS_HINTS: Hints =
     &[("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+// The `_NS` variants are for namespaced types: they also list the namespace picker.
+const WORKLOAD_HINTS_NS: Hints = &[
+    ("Enter", "pods"),
+    ("^n", "namespace"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+const GENERIC_HINTS_NS: Hints = &[
+    ("Enter", "describe"),
+    ("^n", "namespace"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+    ("q", "quit"),
+];
+const GENERIC_DETAILS_HINTS_NS: Hints =
+    &[("^n", "namespace"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
 const WORKLOAD_HINTS: Hints = &[
     ("Enter", "pods"),
     ("d", "describe"),
@@ -1424,7 +1455,7 @@ enum ListKind<'a> {
     Namespaces,
     Pods(&'a MetricsState),
     Nodes(&'a MetricsState),
-    Workload(workloads::Workload),
+    Pane(panes::Pane),
 }
 
 fn count_text(n: Option<u64>) -> String {
@@ -1448,7 +1479,7 @@ fn render_list(
     status: &str,
 ) {
     let (pods, nodes, metrics) = match kind {
-        ListKind::Namespaces | ListKind::Workload(_) => (false, false, None),
+        ListKind::Namespaces | ListKind::Pane(_) => (false, false, None),
         ListKind::Pods(m) => (true, false, Some(m)),
         ListKind::Nodes(m) => (false, true, Some(m)),
     };
@@ -1464,10 +1495,10 @@ fn render_list(
     let status_cell = |n: &Item| Cell::from(n.status.clone()).style(Style::new().fg(status_color(&n.status)));
 
     // (title, which sort column it is, width)
-    let workload = if let ListKind::Workload(w) = kind { Some(w) } else { None };
+    let workload = if let ListKind::Pane(w) = kind { Some(w) } else { None };
     let columns: Vec<(&str, Option<Column>, Constraint)> = if let Some(w) = workload {
         let mut c = vec![("NAME", Some(Column::Name), Constraint::Fill(2)), ("STATUS", Some(Column::Status), Constraint::Length(14))];
-        c.extend(workloads::columns(w).into_iter().map(|(t, w)| (t, None, w)));
+        c.extend(panes::columns(w).into_iter().map(|(t, w)| (t, None, w)));
         c.push(("AGE", Some(Column::Age), Constraint::Length(5)));
         c
     } else if nodes {
@@ -1506,18 +1537,28 @@ fn render_list(
             ("LABELS", None, Constraint::Fill(2)),
         ]
     };
+    // A STATUS column that says nothing for any row (ConfigMaps, most CRDs...) is left out.
+    let status_at = columns.iter().position(|c| c.0 == "STATUS");
+    let hide_status = status_at.filter(|_| visible.iter().all(|n| n.status.is_empty()));
+    fn mk<'a>(mut cells: Vec<Cell<'a>>, hide: Option<usize>) -> Row<'a> {
+        if let Some(i) = hide {
+            cells.remove(i);
+        }
+        Row::new(cells)
+    }
+    let columns: Vec<_> = columns.into_iter().enumerate().filter(|(i, _)| Some(*i) != hide_status).map(|(_, c)| c).collect();
     let rows = visible.iter().map(|n| {
         let age = Cell::from(format_age(now - n.created));
         if let (Some(extra), true) = (&n.extra, workload.is_some()) {
             let mut cells = vec![Cell::from(n.name.clone()), status_cell(n)];
             cells.extend(extra.iter().map(|(t, c)| Cell::from(t.clone()).style(Style::new().fg(*c))));
             cells.push(age);
-            return Row::new(cells);
+            return mk(cells, hide_status);
         }
         match (&n.pod, &n.node, metrics) {
             (_, Some(nc), Some(m)) => {
                 let u = m.usage.get(&n.name);
-                Row::new([
+                mk(vec![
                     Cell::from(n.name.clone()),
                     status_cell(n),
                     Cell::from(nc.roles.clone()),
@@ -1528,11 +1569,11 @@ fn render_list(
                     Cell::from(nc.ip.clone()),
                     Cell::from(nc.os.clone()),
                     age,
-                ])
+                ], hide_status)
             }
             (Some(p), _, Some(m)) => {
                 let u = m.usage.get(&n.name);
-                Row::new([
+                mk(vec![
                     Cell::from(n.name.clone()),
                     Cell::from(p.ready.clone()),
                     status_cell(n),
@@ -1545,9 +1586,9 @@ fn render_list(
                     Cell::from(mem_text(p.mem_lim)),
                     Cell::from(p.image.clone()),
                     age,
-                ])
+                ], hide_status)
             }
-            _ => Row::new([Cell::from(n.name.clone()), status_cell(n), age, labels_cell(n)]),
+            _ => mk(vec![Cell::from(n.name.clone()), status_cell(n), age, labels_cell(n)], hide_status),
         }
     });
     let header = Row::new(columns.iter().map(|(title, col, _)| match col {
@@ -1861,12 +1902,19 @@ fn run_app(
                                 Some(i) => ns_matches.get(i).map(|n| Some(n.clone())),
                             };
                             if let Some(scope) = target.filter(|t| *t != current) {
-                                if let Some(old) = pods.take() {
-                                    activity.finish(old.loading); // dropping `old` aborts its watchers
+                                if let Some(old) = generic.take() {
+                                    // same resource type, new namespace
+                                    activity.finish(old.loading);
+                                    let info = old.info.clone();
+                                    generic = Some(open_generic(client, rt, &tx, &mut activity, info, scope, state.sort.resource));
+                                } else {
+                                    if let Some(old) = pods.take() {
+                                        activity.finish(old.loading); // dropping `old` aborts its watchers
+                                    }
+                                    pods = Some(open_pods(client, rt, &tx, &mut activity, scope, None));
+                                    *lists.last_mut().unwrap() = ListView::sorted(state.sort.resource);
+                                    viewing = None;
                                 }
-                                pods = Some(open_pods(client, rt, &tx, &mut activity, scope, None));
-                                *lists.last_mut().unwrap() = ListView::sorted(state.sort.resource);
-                                viewing = None;
                             }
                             None
                         }
@@ -2055,6 +2103,10 @@ fn run_app(
                     }
                     pods = Some(open_pods(client, rt, &tx, &mut activity, scope, Some(filter)));
                     lists.push(ListView::sorted(state.sort.resource));
+                }
+                Some(generic_view::Action::PickNamespace) => {
+                    let current = generic.as_ref().and_then(|g| g.scope.clone());
+                    modal = Some(Modal::Namespaces { query: String::new(), sel: 0, current });
                 }
                 Some(generic_view::Action::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
                 Some(generic_view::Action::Copy(text)) => {
@@ -2367,11 +2419,35 @@ mod tests {
         };
         let mut term = Terminal::new(TestBackend::new(140, 6)).unwrap();
         let mut list = ListView::sorted(state::Sort::default());
-        term.draw(|f| render_list(f, f.area(), ListKind::Workload(workloads::Workload::Deployment), &[&item], 1, &mut list, "")).unwrap();
+        term.draw(|f| render_list(f, f.area(), ListKind::Pane(panes::Pane::Deployment), &[&item], 1, &mut list, "")).unwrap();
         let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         for want in ["UP-TO-DATE", "AVAILABLE", "STRATEGY", "IMAGES", "Available", "3/3", "RollingUpdate", "web:1"] {
             assert!(text.contains(want), "missing {want}");
         }
+    }
+
+    #[test]
+    fn status_column_is_hidden_when_no_row_has_one() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let item = |status: &str| Item {
+            name: "cm".into(),
+            status: status.into(),
+            created: 0,
+            labels: vec![],
+            pod: None,
+            node: None,
+            extra: Some(vec![("2".into(), Color::Reset), ("a, b".into(), Color::Reset)]),
+        };
+        let draw = |status: &str| {
+            let it = item(status);
+            let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
+            let mut list = ListView::sorted(state::Sort::default());
+            term.draw(|f| render_list(f, f.area(), ListKind::Pane(panes::Pane::ConfigMap), &[&it], 1, &mut list, "")).unwrap();
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+        let (without, with) = (draw(""), draw("Ready"));
+        assert!(!without.contains("STATUS") && without.contains("KEYS") && without.contains("a, b"));
+        assert!(with.contains("STATUS") && with.contains("Ready") && with.contains("a, b"));
     }
 
     #[test]
