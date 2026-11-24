@@ -25,7 +25,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Resource, ResourceExt,
-    api::{DeleteParams, ListParams, PostParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
     core::{ApiResource, DynamicObject, GroupVersionKind},
     runtime::{WatchStreamExt, reflector, reflector::Store, watcher},
 };
@@ -695,6 +695,36 @@ const WORKLOAD_HINTS: Hints = &[
     ("A", "asc/desc"),
     ("Esc", "back"),
 ];
+// Workloads that can be scaled and/or restarted (a key for a thing the kind lacks just says so).
+const SCALE_HINTS_NS: Hints = &[
+    ("Enter", "pods"),
+    ("s", "scale"),
+    ("R", "restart"),
+    ("^n", "namespace"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
+const SCALE_HINTS: Hints = &[
+    ("Enter", "pods"),
+    ("s", "scale"),
+    ("R", "restart"),
+    ("d", "describe"),
+    ("/", "search"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("< >", "sort column"),
+    ("A", "asc/desc"),
+    ("Esc", "back"),
+];
 // Types with a next level down (Gateway API, Ingress...): Enter walks the hierarchy.
 const HOP_HINTS_NS: Hints = &[
     ("Enter", "open next"),
@@ -809,7 +839,13 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
     }
     frame.render_widget(Paragraph::new(Line::from(trail_spans)), trail);
 
-    let help = Line::from(vec![Span::styled("? ", bold.fg(Color::Yellow)), Span::styled("help ", dim)]).right_aligned();
+    let help = Line::from(vec![
+        Span::styled("^x ", bold.fg(Color::Yellow)),
+        Span::styled("context  ", dim),
+        Span::styled("? ", bold.fg(Color::Yellow)),
+        Span::styled("help ", dim),
+    ])
+    .right_aligned();
     frame.render_widget(Paragraph::new(help), trail);
 }
 
@@ -1082,17 +1118,79 @@ fn open_pods(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Fetch before entering the TUI so errors print on a normal terminal.
-    let client = Client::try_default().await?;
+    let state_path = state::default_path();
+    let (mut state, mut notice) = state::State::load(state_path.as_deref());
+    let mut session = connect(None).await?;
+    let rt = tokio::runtime::Handle::current();
+    // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
+    // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
+    tokio::task::spawn_blocking(move || {
+        ratatui::run(|terminal| loop {
+            let notice_now = std::mem::take(&mut notice);
+            let exit = run_app(terminal, &session.store, &session.api, &session.client, &rt, &session.info, state.clone(), state_path.as_deref(), notice_now, &session.resource_types)?;
+            match exit {
+                Exit::Quit => return Ok::<(), std::io::Error>(()),
+                Exit::Switch { context, state: last } => {
+                    state = last;
+                    match rt.block_on(connect(Some(&context))) {
+                        Ok(next) => {
+                            session = next; // dropping the old session stops its background tasks
+                            state.namespace = None; // that namespace may not exist over there
+                            notice = format!("switched to context {context}");
+                        }
+                        Err(e) => notice = format!("cannot switch to {context}: {e:#}"),
+                    }
+                }
+            }
+        })
+    })
+    .await??;
+    Ok(())
+}
+
+/// How `run_app` ended.
+enum Exit {
+    Quit,
+    Switch { context: String, state: state::State }, // Ctrl+x: reconnect to another kubeconfig context
+}
+
+/// Everything tied to one cluster connection. Dropping it stops its background tasks.
+struct Session {
+    client: Client,
+    api: Api<Namespace>,
+    store: Store<Namespace>,
+    info: HeaderInfo,
+    resource_types: Arc<OnceLock<Vec<resources::ResourceInfo>>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Connect to the named kubeconfig context, or to the current one.
+async fn connect(context: Option<&str>) -> anyhow::Result<Session> {
+    let (client, name) = match context {
+        None => (Client::try_default().await?, current_context()),
+        Some(c) => {
+            let options = kube::config::KubeConfigOptions { context: Some(c.to_string()), ..Default::default() };
+            (Client::try_from(kube::Config::from_kubeconfig(&options).await?)?, c.to_string())
+        }
+    };
     let api: Api<Namespace> = Api::all(client.clone());
-    let info = HeaderInfo { context: current_context(), version: Arc::new(OnceLock::new()) };
+    let info = HeaderInfo { context: name, version: Arc::new(OnceLock::new()) };
+    let mut tasks = Vec::new();
     {
         // Ask for the server version in the background so an unreachable cluster can't block startup.
-        let version = info.version.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
+        let (version, client) = (info.version.clone(), client.clone());
+        tasks.push(tokio::spawn(async move {
             let v = client.apiserver_version().await.map(|i| i.git_version);
             let _ = version.set(v.unwrap_or_else(|_| "unreachable".into()));
-        });
+        }));
     }
     // Informer: the watcher streams events, the reflector mirrors them into `store`.
     let (store, writer) = reflector::store();
@@ -1100,29 +1198,41 @@ async fn main() -> anyhow::Result<()> {
         .default_backoff() // retry with backoff on errors instead of ending
         .applied_objects();
     // The stream does nothing unless polled, so drive it in a background task.
-    tokio::spawn(events.for_each(|_| async {}));
-
-    let rt = tokio::runtime::Handle::current();
-    // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
-    // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
-    let state_path = state::default_path();
-    let (state, notice) = state::State::load(state_path.as_deref());
+    tasks.push(tokio::spawn(events.for_each(|_| async {})));
     // Resource types come from API discovery in the background; `:` works with a short built-in list until then.
     let resource_types: Arc<OnceLock<Vec<resources::ResourceInfo>>> = Arc::default();
     {
         let (client, out) = (client.clone(), resource_types.clone());
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let found = resources::discover(&client).await;
             if !found.is_empty() {
                 let _ = out.set(found);
             }
-        });
+        }));
     }
-    tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| run_app(terminal, &store, &api, &client, &rt, &info, state, state_path.as_deref(), notice, &resource_types))
-    })
-    .await??;
-    Ok(())
+    Ok(Session { client, api, store, info, resource_types, tasks })
+}
+
+/// Context names from the kubeconfig, sorted.
+fn context_names() -> Vec<String> {
+    let mut names: Vec<String> = kube::config::Kubeconfig::read().map(|c| c.contexts.into_iter().map(|c| c.name).collect()).unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Best fuzzy match first; everything (in order) for an empty query.
+fn context_matches(names: &[String], query: &str) -> Vec<String> {
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, &String)> = names.iter().filter_map(|n| Some((if query.is_empty() { 0 } else { matcher.fuzzy_match(n, query)? }, n))).collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().map(|(_, n)| n.clone()).collect()
+}
+
+async fn patch_message(api: Api<DynamicObject>, name: String, patch: k8s_openapi::serde_json::Value, done: String) -> String {
+    match api.patch(&name, &PatchParams::default(), &Patch::Merge(patch)).await {
+        Ok(_) => done,
+        Err(e) => format!("{name}: {e}"),
+    }
 }
 
 /// A popup that grabs all keys until closed.
@@ -1134,6 +1244,9 @@ enum Modal {
     Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
     Drain { node: String, opts: drain::DrainOpts, focus: usize, yes: bool }, // focus 0..=3 = checkboxes, 4 = buttons
     Command { query: String, sel: usize },                              // `:` resource picker
+    Scale { key: String, kind: String, input: String },                 // replica count typed so far
+    Restart { key: String, kind: String, yes: bool },
+    Contexts { query: String, sel: usize, names: Vec<String>, current: String }, // Ctrl+x
 }
 
 /// A list of any resource type; the spinner stops when its first full list has arrived.
@@ -1305,6 +1418,47 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
             ]))];
             items.extend(ns_matches.iter().map(|n| ListItem::new(format!("{n}{}", mark(current.as_deref() == Some(n.as_str()))))));
             let mut state = ListState::default().with_selected(Some((*sel).min(ns_matches.len())));
+            frame.render_stateful_widget(List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)), list, &mut state);
+            frame.set_cursor_position((input.x + 2 + query.chars().count() as u16, input.y));
+        }
+        Modal::Scale { key, kind, input } => {
+            let area = frame.area().centered(Constraint::Length(46), Constraint::Length(5));
+            frame.render_widget(Clear, area);
+            let lines = vec![
+                Line::from(format!("Scale {kind} \"{key}\"")),
+                Line::raw(""),
+                Line::from(vec![Span::styled("replicas: ", Style::new().fg(Color::DarkGray)), Span::raw(input.as_str())]),
+            ];
+            frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Scale (↑↓ ±1, Enter, Esc) ")), area);
+            frame.set_cursor_position((area.x + 1 + 10 + input.chars().count() as u16, area.y + 3));
+        }
+        Modal::Restart { key, kind, yes } => {
+            let area = frame.area().centered(Constraint::Percentage(55), Constraint::Length(6));
+            frame.render_widget(Clear, area);
+            let button = |label: &str, focused: bool| {
+                let style = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                Span::styled(format!(" {label} "), style)
+            };
+            let text = vec![
+                Line::from(format!("Restart {kind} \"{key}\"?")),
+                Line::from(Span::styled("its pods are replaced, a few at a time", Style::new().fg(Color::DarkGray))),
+                Line::raw(""),
+                Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]),
+            ];
+            frame.render_widget(Paragraph::new(text).centered().block(Block::bordered().border_style(Style::new().fg(Color::Yellow)).title(" Restart (y/n, Enter) ")), area);
+        }
+        Modal::Contexts { query, sel, names, current } => {
+            let found = context_matches(names, query);
+            let height = (found.len() as u16 + 4).min(frame.area().height * 7 / 10).max(5);
+            let area = frame.area().centered(Constraint::Length(60), Constraint::Length(height));
+            frame.render_widget(Clear, area);
+            let block = Block::bordered().title(" Context (Enter, Esc) ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled("> ", Style::new().fg(Color::Yellow)), Span::raw(query.as_str())])), input);
+            let items: Vec<ListItem> = found.iter().map(|n| ListItem::new(format!("{n}{}", if n == current { " ●" } else { "" }))).collect();
+            let mut state = ListState::default().with_selected(Some((*sel).min(found.len().saturating_sub(1))));
             frame.render_stateful_widget(List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)), list, &mut state);
             frame.set_cursor_position((input.x + 2 + query.chars().count() as u16, input.y));
         }
@@ -1691,7 +1845,7 @@ fn run_app(
     state_path: Option<&std::path::Path>,
     notice: String,
     resource_types: &OnceLock<Vec<resources::ResourceInfo>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Exit> {
     let matcher = SkimMatcherV2::default();
     let builtin_types = resources::builtin(); // until discovery answers
     // lists[0] is namespaces; a pod level pushes a second one and pops it on the way back.
@@ -1987,6 +2141,71 @@ fn run_app(
                     }
                     _ => Some(Modal::Delete { name, kind, yes }),
                 },
+                Modal::Scale { key: k, kind: kd, mut input } => match key.code {
+                    KeyCode::Enter => match (input.parse::<u32>(), &generic) {
+                        (Ok(n), Some(g)) => {
+                            let (api, real) = (g.api_for(&k), k.rsplit('/').next().unwrap_or(&k).to_string());
+                            let done = format!("{real} scaled to {n}");
+                            spawn_op(rt, &tx, &mut activity, format!("scaling {real}"), async move {
+                                patch_message(api, real, k8s_openapi::serde_json::json!({"spec": {"replicas": n}}), done).await
+                            });
+                            None
+                        }
+                        _ => Some(Modal::Scale { key: k, kind: kd, input }), // not a number yet
+                    },
+                    KeyCode::Esc => None,
+                    KeyCode::Up => Some(Modal::Scale { key: k, kind: kd, input: input.parse::<u32>().map_or(0, |n| n.saturating_add(1)).to_string() }),
+                    KeyCode::Down => Some(Modal::Scale { key: k, kind: kd, input: input.parse::<u32>().map_or(0, |n| n.saturating_sub(1)).to_string() }),
+                    KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 6 => {
+                        input.push(c);
+                        Some(Modal::Scale { key: k, kind: kd, input })
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                        Some(Modal::Scale { key: k, kind: kd, input })
+                    }
+                    _ => Some(Modal::Scale { key: k, kind: kd, input }),
+                },
+                Modal::Restart { key: k, kind: kd, yes } => match key.code {
+                    code if code == KeyCode::Char('y') || (code == KeyCode::Enter && yes) => {
+                        if let Some(g) = &generic {
+                            let (api, real) = (g.api_for(&k), k.rsplit('/').next().unwrap_or(&k).to_string());
+                            let stamp = k8s_openapi::jiff::Timestamp::now().to_string();
+                            // what `kubectl rollout restart` does: a new annotation changes the template, so the controller rolls the pods
+                            let patch = k8s_openapi::serde_json::json!({"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": stamp}}}}});
+                            let done = format!("{real} restarting");
+                            spawn_op(rt, &tx, &mut activity, format!("restarting {real}"), async move { patch_message(api, real, patch, done).await });
+                        }
+                        None
+                    }
+                    KeyCode::Char('n') | KeyCode::Enter | KeyCode::Esc => None,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => Some(Modal::Restart { key: k, kind: kd, yes: !yes }),
+                    _ => Some(Modal::Restart { key: k, kind: kd, yes }),
+                },
+                Modal::Contexts { mut query, sel, names, current } => {
+                    let found = context_matches(&names, &query);
+                    let sel = sel.min(found.len().saturating_sub(1));
+                    match key.code {
+                        KeyCode::Enter => match found.get(sel) {
+                            Some(c) if *c != current => return Ok(Exit::Switch { context: c.clone(), state }),
+                            _ => None,
+                        },
+                        KeyCode::Esc => None,
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Contexts { query, sel: (sel + 1).min(found.len().saturating_sub(1)), names, current }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Contexts { query, sel: sel.saturating_sub(1), names, current }),
+                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Contexts { query, sel: (sel + 1).min(found.len().saturating_sub(1)), names, current }),
+                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Contexts { query, sel: sel.saturating_sub(1), names, current }),
+                        KeyCode::Char(c) if !ctrl => {
+                            query.push(c);
+                            Some(Modal::Contexts { query, sel: 0, names, current })
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            Some(Modal::Contexts { query, sel: 0, names, current })
+                        }
+                        _ => Some(Modal::Contexts { query, sel, names, current }),
+                    }
+                }
                 Modal::Help(_) => None, // any key closes it
                 Modal::Namespaces { mut query, sel, current } => {
                     let sel = sel.min(ns_matches.len());
@@ -2159,6 +2378,10 @@ fn run_app(
             };
             continue;
         }
+        if ctrl && key.code == KeyCode::Char('x') && !typing {
+            modal = Some(Modal::Contexts { query: String::new(), sel: 0, names: context_names(), current: info.context.clone() });
+            continue;
+        }
         if key.code == KeyCode::Char('?') && !typing {
             modal = Some(Modal::Help(hints));
             continue;
@@ -2185,7 +2408,7 @@ fn run_app(
         if let Some(t) = &mut tree {
             match t.handle_key(key) {
                 Some(tree_view::Act::Close) => tree = None,
-                Some(tree_view::Act::Quit) => return Ok(()),
+                Some(tree_view::Act::Quit) => return Ok(Exit::Quit),
                 Some(tree_view::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
                 None => {}
             }
@@ -2197,7 +2420,7 @@ fn run_app(
                     helm = None;
                     dashboard = Some(dashboard::Dashboard::open(rt, client));
                 }
-                Some(helm::Act::Quit) => return Ok(()),
+                Some(helm::Act::Quit) => return Ok(Exit::Quit),
                 Some(helm::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
                 Some(helm::Act::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
                 Some(helm::Act::Values(name, json)) => {
@@ -2213,7 +2436,7 @@ fn run_app(
         }
         if let Some(d) = &mut dashboard {
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(Exit::Quit),
                 KeyCode::Char('j') | KeyCode::Down => d.step(1),
                 KeyCode::Char('k') | KeyCode::Up => d.step(-1),
                 KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
@@ -2244,7 +2467,7 @@ fn run_app(
                         None => message = "this cluster does not serve that resource type (or discovery is still loading)".into(),
                     }
                 }
-                Some(generic_view::Action::Quit) => return Ok(()),
+                Some(generic_view::Action::Quit) => return Ok(Exit::Quit),
                 Some(generic_view::Action::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
                 Some(generic_view::Action::Cordon(node)) => {
                     let (client, label) = (client.clone(), format!("cordoning {node}"));
@@ -2278,6 +2501,11 @@ fn run_app(
                         Err(e) => format!("copy failed: {e:#}"),
                     };
                 }
+                Some(generic_view::Action::Scale(key)) => {
+                    let current = generic.as_ref().and_then(|g| find_in(g.store(), &key)).and_then(|o| o.data["spec"]["replicas"].as_u64()).unwrap_or(1);
+                    modal = Some(Modal::Scale { key, kind: kind.clone(), input: current.to_string() });
+                }
+                Some(generic_view::Action::Restart(key)) => modal = Some(Modal::Restart { key, kind: kind.clone(), yes: false }),
                 Some(generic_view::Action::Delete(name)) => modal = Some(Modal::Delete { name, kind: kind.clone(), yes: false }),
                 Some(generic_view::Action::Edit(name)) => {
                     if let Some(g) = &generic {
@@ -2381,7 +2609,7 @@ fn run_app(
                         _ => {}
                     }
                 }
-                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('q') => return Ok(Exit::Quit),
                 KeyCode::Esc if list.query.is_empty() => {
                     if in_pods {
                         go_back = true;
@@ -2628,5 +2856,23 @@ mod tests {
         assert_eq!(cpu_text(None), "-");
         assert_eq!(short_image("registry.io:5000/team/app:1.2"), "team/app:1.2");
         assert_eq!(short_image("nginx:1.25"), "nginx:1.25");
+    }
+
+    #[test]
+    fn context_picker_filters_fuzzily_and_lists_all_when_empty() {
+        let names: Vec<String> = ["prod-eu", "staging", "prod-us"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(context_matches(&names, ""), ["prod-eu", "prod-us", "staging"]);
+        assert_eq!(context_matches(&names, "stg"), ["staging"]);
+        assert_eq!(context_matches(&names, "prod").len(), 2);
+        assert!(context_matches(&names, "zzz").is_empty());
+    }
+
+    #[test]
+    fn scale_and_restart_apply_to_the_right_kinds() {
+        use panes::Pane::*;
+        assert!([Deployment, ReplicaSet, StatefulSet, ReplicationController].iter().all(|w| panes::scalable(*w)));
+        assert!(!panes::scalable(DaemonSet) && !panes::scalable(Job));
+        assert!([Deployment, StatefulSet, DaemonSet].iter().all(|w| panes::restartable(*w)));
+        assert!(!panes::restartable(ReplicaSet) && !panes::restartable(Service));
     }
 }

@@ -73,6 +73,8 @@ Press `?` in any view for the keys of that view. The main ones:
 | `y` | YAML |
 | `e` | Edit in `$EDITOR` |
 | `Ctrl+d` | Delete (asks first) |
+| `s` `R` | Deployment, StatefulSet, ReplicaSet, ReplicationController: scale; Deployment, StatefulSet, DaemonSet: rolling restart (asks first) |
+| `Ctrl+x` | Switch kubeconfig context without restarting |
 | `l` | Logs of the pod (in a container view: that container) |
 | `c` `u` `C` | Node: cordon, uncordon, drain (Shift+c opens the options) |
 | `Esc` | Back (namespace list → dashboard, dashboard: quit) |

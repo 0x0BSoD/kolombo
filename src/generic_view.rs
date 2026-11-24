@@ -2,7 +2,7 @@
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
 use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, HOP_HINTS, HOP_HINTS_NS, ROUTES_HINTS, ROUTES_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
+    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, HOP_HINTS, HOP_HINTS_NS, SCALE_HINTS, SCALE_HINTS_NS, ROUTES_HINTS, ROUTES_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
     field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
 };
 use crate::resources::ResourceInfo;
@@ -40,6 +40,8 @@ pub enum Action {
     Copy(String),
     Delete(String), // list key
     Edit(String),
+    Scale(String),   // list key: ask for a replica count
+    Restart(String), // list key: ask to roll the pods
 }
 
 /// Hides every object that is not a child of the one we drilled down from. Done on our side because
@@ -261,6 +263,14 @@ impl GenericView {
         self.info.namespaced && self.filter.is_none()
     }
 
+    fn scalable(&self) -> bool {
+        panes::kind_of(&self.info).is_some_and(panes::scalable)
+    }
+
+    fn restartable(&self) -> bool {
+        panes::kind_of(&self.info).is_some_and(panes::restartable)
+    }
+
     pub fn hints(&self) -> Hints {
         let ns = self.can_pick_namespace();
         let pane = panes::kind_of(&self.info);
@@ -276,6 +286,8 @@ impl GenericView {
             }
         } else if nodes::is_nodes(&self.info) {
             NODE_HINTS
+        } else if self.scalable() || self.restartable() {
+            if ns { SCALE_HINTS_NS } else { SCALE_HINTS }
         } else if pane.is_some_and(panes::has_pods) {
             if ns { WORKLOAD_HINTS_NS } else { WORKLOAD_HINTS }
         } else if pane.is_some_and(net_panes::has_routes) {
@@ -347,6 +359,8 @@ impl GenericView {
             match key.code {
                 KeyCode::Char('d') if ctrl => return Some(Action::Delete(k)),
                 KeyCode::Char('e') => return Some(Action::Edit(k)),
+                KeyCode::Char('s') if self.scalable() => return Some(Action::Scale(k)),
+                KeyCode::Char('R') if self.restartable() => return Some(Action::Restart(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
                 KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
                 KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
@@ -421,6 +435,8 @@ impl GenericView {
                 }
             }
             KeyCode::Char('e') => return selected.map(Action::Edit),
+            KeyCode::Char('s') if self.scalable() => return selected.map(Action::Scale),
+            KeyCode::Char('R') if self.restartable() => return selected.map(Action::Restart),
             KeyCode::Char('q') => return Some(Action::Quit),
             KeyCode::Esc if self.list.query.is_empty() => return Some(Action::Close),
             KeyCode::Esc => self.list.query.clear(),

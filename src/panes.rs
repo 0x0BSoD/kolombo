@@ -217,6 +217,16 @@ pub fn selector_string(sel: &Value) -> String {
     parts.join(",")
 }
 
+/// `s`: kinds with a replica count.
+pub fn scalable(w: Pane) -> bool {
+    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::ReplicationController)
+}
+
+/// `R`: kinds whose pod template can be re-stamped to roll the pods.
+pub fn restartable(w: Pane) -> bool {
+    matches!(w, Pane::Deployment | Pane::StatefulSet | Pane::DaemonSet)
+}
+
 /// Whether Enter on this kind should open its pods.
 pub fn has_pods(w: Pane) -> bool {
     matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::Job | Pane::Service | Pane::ReplicationController)
