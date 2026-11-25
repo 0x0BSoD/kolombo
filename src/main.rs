@@ -1121,7 +1121,24 @@ async fn main() -> anyhow::Result<()> {
     // Fetch before entering the TUI so errors print on a normal terminal.
     let state_path = state::default_path();
     let (mut state, mut notice) = state::State::load(state_path.as_deref());
+    let (namespace, resource) = parse_args(std::env::args().skip(1))?;
     let mut session = connect(None).await?;
+    if let Some(ns) = namespace {
+        state.namespace = Some(ns);
+    }
+    if let Some(query) = resource {
+        let mut types = resources::discover(&session.client).await;
+        if types.is_empty() {
+            types = resources::builtin(); // discovery failed; `po`, `ns` and friends still work
+        }
+        let info = resources::matches(&types, &query, &SkimMatcherV2::default()).into_iter().next().ok_or_else(|| anyhow::anyhow!("unknown resource type: {query}"))?;
+        state.open = match info.target() {
+            resources::Target::Dashboard => state::Level::Dashboard,
+            resources::Target::Namespaces => state::Level::Namespaces,
+            _ => state::Level::Resource,
+        };
+        state.resource = info;
+    }
     let rt = tokio::runtime::Handle::current();
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
     // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
@@ -1147,6 +1164,24 @@ async fn main() -> anyhow::Result<()> {
     })
     .await??;
     Ok(())
+}
+
+/// `[-n|--namespace NAME] [RESOURCE]`
+fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let (mut namespace, mut resource) = (None, None);
+    let mut args = args;
+    while let Some(a) = args.next() {
+        if a == "-n" || a == "--namespace" {
+            namespace = Some(args.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value"))?);
+        } else if let Some(v) = a.strip_prefix("--namespace=") {
+            namespace = Some(v.to_string());
+        } else if a.starts_with('-') {
+            anyhow::bail!("unknown option: {a}\nusage: kolombo [-n NAMESPACE] [RESOURCE]");
+        } else if resource.replace(a).is_some() {
+            anyhow::bail!("only one resource argument is allowed\nusage: kolombo [-n NAMESPACE] [RESOURCE]");
+        }
+    }
+    Ok((namespace, resource))
 }
 
 /// How `run_app` ended.
@@ -2676,6 +2711,17 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn parses_namespace_and_resource() {
+        let p = |a: &[&str]| parse_args(a.iter().map(|s| s.to_string()));
+        assert_eq!(p(&["-n", "kube-system", "po"]).unwrap(), (Some("kube-system".into()), Some("po".into())));
+        assert_eq!(p(&["svc", "--namespace=x"]).unwrap(), (Some("x".into()), Some("svc".into())));
+        assert_eq!(p(&[]).unwrap(), (None, None));
+        assert!(p(&["-n"]).is_err());
+        assert!(p(&["a", "b"]).is_err());
+        assert!(p(&["--bogus"]).is_err());
     }
 
     #[test]
