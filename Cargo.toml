@@ -1,6 +1,6 @@
 [package]
 name = "kolombo"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["Aleksandr Simonov <zlodey23@gmail.com>"]
 description = "Kolombo - Kubernetes explorer"
