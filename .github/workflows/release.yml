@@ -40,7 +40,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --offline --target ${{ matrix.target }}
       - name: Package
         run: |
           name=kolombo-$GITHUB_REF_NAME-${{ matrix.target }}
