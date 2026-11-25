@@ -2,6 +2,7 @@ mod argo_panes;
 mod batch_panes;
 mod container_view;
 mod dashboard;
+mod images;
 mod drain;
 mod generic_view;
 mod helm;
@@ -358,6 +359,7 @@ struct Details {
     meta: ObjectMeta,
     info: Vec<Line<'static>>,
     pod: Option<PodExtra>, // pods also show containers, conditions and events
+    node: Option<nodes::NodeExtra>, // nodes show resource bars and conditions
 }
 
 struct ContainerRow {
@@ -515,6 +517,7 @@ fn ns_details(ns: &Namespace) -> Details {
             field("UID", Span::raw(ns.metadata.uid.clone().unwrap_or_default())),
         ],
         pod: None,
+        node: None,
     }
 }
 
@@ -551,6 +554,7 @@ fn pod_details(pod: &Pod, events: &Store<KubeEvent>) -> Details {
             conditions: condition_rows(pod),
             events: pod_events(pod, events),
         }),
+        node: None,
     }
 }
 
@@ -595,7 +599,7 @@ type Hints = &'static [(&'static str, &'static str)];
 
 const TREE_HINTS: Hints = &[("j/k", "move"), ("g/G", "top/bottom"), ("Space", "fold"), (":", "resource"), ("Esc", "back"), ("q", "quit")];
 const HELM_HINTS: Hints = &[("Enter", "resource tree"), ("y", "values"), ("j/k", "move"), (":", "resource"), ("Esc", "dashboard"), ("q", "quit")];
-const DASHBOARD_HINTS: Hints = &[("j/k", "select event"), (":", "resource"), ("q", "quit")];
+const DASHBOARD_HINTS: Hints = &[("j/k", "select event"), ("i", "images"), (":", "resource"), ("q", "quit")];
 
 const LIST_HINTS: Hints = &[
     ("Enter", "pods"),
@@ -654,7 +658,7 @@ const NODE_HINTS: Hints = &[
     ("Esc", "back"),
 ];
 const NODE_DETAILS_HINTS: Hints =
-    &[("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+    &[("i", "images"), ("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
 // The `_NS` variants are for namespaced types: they also list the namespace picker.
 const WORKLOAD_HINTS_NS: Hints = &[
     ("Enter", "pods"),
@@ -859,6 +863,35 @@ fn render_details(frame: &mut Frame, area: Rect, d: &Details, sel: &mut TableSta
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let info_box = Paragraph::new(d.info.clone()).block(Block::bordered().border_style(dim).title(" Info "));
+
+    if let Some(n) = &d.node {
+        let [top, conds, meta] =
+            Layout::vertical([Constraint::Length(d.info.len().max(6) as u16 + 2), Constraint::Fill(1), Constraint::Length(7)]).areas(inner);
+        let [info, res] = Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
+        frame.render_widget(info_box, info);
+        let res_box = Block::bordered().border_style(dim).title(" Resources ");
+        let res_inner = res_box.inner(res);
+        frame.render_widget(res_box, res);
+        let rows = Layout::vertical([Constraint::Length(2); 3]).split(res_inner);
+        for (bar, at) in n.bars.iter().zip(rows.iter()) {
+            let color = if bar.ratio >= 0.9 { Color::Red } else if bar.ratio >= 0.7 { Color::Yellow } else { Color::Green };
+            dashboard::meter(frame, *at, bar.label, &bar.detail, bar.ratio, 0.0, color);
+        }
+        let cond_rows = n.conditions.iter().map(|c| {
+            let mark = if c.ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
+            Row::new([Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])), Cell::from(c.age.clone()), Cell::from(c.reason.clone())])
+        });
+        frame.render_widget(
+            Table::new(cond_rows, [Constraint::Length(22), Constraint::Length(6), Constraint::Fill(1)])
+                .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
+                .block(Block::bordered().border_style(dim).title(" Conditions ")),
+            conds,
+        );
+        let [labels, annotations] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
+        frame.render_widget(map_table("Labels", &d.meta.labels, 4), labels);
+        frame.render_widget(map_table("Annotations", &d.meta.annotations, 4), annotations);
+        return;
+    }
 
     let Some(x) = &d.pod else {
         let [info, labels, annotations] =
@@ -1283,6 +1316,7 @@ enum Modal {
     Scale { key: String, kind: String, input: String },                 // replica count typed so far
     Restart { key: String, kind: String, yes: bool },
     Contexts { query: String, sel: usize, names: Vec<String>, current: String }, // Ctrl+x
+    Images { title: String, rows: Vec<(String, usize)>, sel: usize }, // `i`: image, pods running it
 }
 
 /// A list of any resource type; the spinner stops when its first full list has arrived.
@@ -1355,6 +1389,24 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
             frame.render_widget(
                 Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")),
                 area,
+            );
+        }
+        Modal::Images { title, rows, sel } => {
+            let height = (rows.len() as u16 + 2).clamp(3, frame.area().height.saturating_sub(4));
+            let area = frame.area().centered(Constraint::Percentage(80), Constraint::Length(height));
+            frame.render_widget(Clear, area);
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|(image, n)| ListItem::new(Line::from(vec![Span::styled(format!("{n:>4}  "), Style::new().fg(Color::Yellow)), Span::raw(image.clone())])))
+                .collect();
+            let total: usize = rows.iter().map(|r| r.1).sum();
+            let mut state = ListState::default().with_selected(Some(*sel));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                    .block(Block::bordered().title(format!(" {title}: {} images, {total} pod refs (Esc) ", rows.len()))),
+                area,
+                &mut state,
             );
         }
         Modal::Containers { names, sel, .. } => {
@@ -2243,6 +2295,12 @@ fn run_app(
                     }
                 }
                 Modal::Help(_) => None, // any key closes it
+                Modal::Images { title, rows, sel } => match key.code {
+                    KeyCode::Esc | KeyCode::Char('q' | 'i') => None,
+                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Images { sel: (sel + 1).min(rows.len().saturating_sub(1)), title, rows }),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Images { sel: sel.saturating_sub(1), title, rows }),
+                    _ => Some(Modal::Images { title, rows, sel }),
+                },
                 Modal::Namespaces { mut query, sel, current } => {
                     let sel = sel.min(ns_matches.len());
                     match key.code {
@@ -2476,6 +2534,7 @@ fn run_app(
                 KeyCode::Char('j') | KeyCode::Down => d.step(1),
                 KeyCode::Char('k') | KeyCode::Up => d.step(-1),
                 KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                KeyCode::Char('i') => modal = Some(Modal::Images { title: "Cluster images".into(), rows: d.images(), sel: 0 }),
                 _ => {}
             }
             continue;
@@ -2505,6 +2564,7 @@ fn run_app(
                 }
                 Some(generic_view::Action::Quit) => return Ok(Exit::Quit),
                 Some(generic_view::Action::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
+                Some(generic_view::Action::Images { title, rows }) => modal = Some(Modal::Images { title, rows, sel: 0 }),
                 Some(generic_view::Action::Cordon(node)) => {
                     let (client, label) = (client.clone(), format!("cordoning {node}"));
                     spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, true).await });

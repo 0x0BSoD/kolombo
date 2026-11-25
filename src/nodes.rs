@@ -120,29 +120,55 @@ pub async fn fetch_usage(client: &Client) -> Result<HashMap<String, Usage>, kube
         .collect())
 }
 
-/// Rows for the describe view, live usage included when metrics-server answered.
-pub fn info_rows(o: &DynamicObject, usage: Option<&Usage>, pods: usize) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(Color::DarkGray);
+/// One resource bar of the node details: used of allocatable.
+pub struct Bar {
+    pub label: &'static str,
+    pub detail: String,
+    pub ratio: f64,
+}
+
+/// What the node details show besides the info rows: resource bars and conditions.
+pub struct NodeExtra {
+    pub bars: Vec<Bar>,
+    pub conditions: Vec<crate::CondRow>,
+}
+
+/// Bars (live usage included when metrics-server answered) and conditions for the details view.
+pub fn extra(o: &DynamicObject, usage: Option<&Usage>, pods: usize) -> NodeExtra {
     let c = cols(o, pods);
-    let cap = &o.data["status"]["capacity"];
-    let share = |used: Option<u64>, alloc: Option<u64>| match (used, alloc) {
-        (Some(u), Some(a)) if a > 0 => format!(" ({}%)", u * 100 / a),
-        _ => String::new(),
+    let ratio = |used: Option<u64>, alloc: Option<u64>| match (used, alloc) {
+        (Some(u), Some(a)) if a > 0 => u as f64 / a as f64,
+        _ => 0.0,
     };
-    let cpu = format!(
-        "used {} / allocatable {} / capacity {}{}",
-        cpu_text(usage.map(|u| u.cpu)),
-        cpu_text(c.cpu_alloc),
-        cpu_text(cap["cpu"].as_str().and_then(parse_cpu)),
-        share(usage.map(|u| u.cpu), c.cpu_alloc)
-    );
-    let mem = format!(
-        "used {} / allocatable {} / capacity {}{}",
-        mem_text(usage.map(|u| u.mem)),
-        mem_text(c.mem_alloc),
-        mem_text(cap["memory"].as_str().and_then(parse_mem)),
-        share(usage.map(|u| u.mem), c.mem_alloc)
-    );
+    let bars = vec![
+        Bar { label: "CPU", detail: format!("{}/{}", cpu_text(usage.map(|u| u.cpu)), cpu_text(c.cpu_alloc)), ratio: ratio(usage.map(|u| u.cpu), c.cpu_alloc) },
+        Bar { label: "Memory", detail: format!("{}/{}", mem_text(usage.map(|u| u.mem)), mem_text(c.mem_alloc)), ratio: ratio(usage.map(|u| u.mem), c.mem_alloc) },
+        Bar {
+            label: "Pods",
+            detail: format!("{}/{}", c.pods, c.pods_alloc.map_or("-".into(), |a| a.to_string())),
+            ratio: ratio(Some(c.pods as u64), c.pods_alloc),
+        },
+    ];
+    let conditions = o.data["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let kind = c["type"].as_str().unwrap_or_default();
+            // Ready is good when True; the pressure conditions are good when False.
+            let ok = (c["status"].as_str() == Some("True")) == (kind == "Ready");
+            let reason = [c["reason"].as_str(), c["message"].as_str()].into_iter().flatten().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(": ");
+            let age = c["lastTransitionTime"].as_str().and_then(|t| t.parse::<k8s_openapi::jiff::Timestamp>().ok()).map_or(String::new(), |t| crate::format_age(k8s_openapi::jiff::Timestamp::now().as_second() - t.as_second()));
+            crate::CondRow { kind: kind.to_string(), ok, age, reason }
+        })
+        .collect();
+    NodeExtra { bars, conditions }
+}
+
+/// Rows of the Info box.
+pub fn info_rows(o: &DynamicObject) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let c = cols(o, 0);
     let taints: Vec<String> = o.data["spec"]["taints"]
         .as_array()
         .into_iter()
@@ -160,9 +186,6 @@ pub fn info_rows(o: &DynamicObject, usage: Option<&Usage>, pods: usize) -> Vec<L
         field("Kernel", Span::raw(text(o, &["nodeInfo", "kernelVersion"]))),
         field("Runtime", Span::raw(text(o, &["nodeInfo", "containerRuntimeVersion"]))),
         field("IP", Span::raw(format!("{} ({})", c.ip, address(o, "Hostname")))),
-        field("CPU", Span::raw(cpu)),
-        field("Memory", Span::raw(mem)),
-        field("Pods", Span::raw(format!("{} / allocatable {}", c.pods, c.pods_alloc.map_or("-".into(), |a| a.to_string())))),
         field("Taints", if taints.is_empty() { Span::styled("<none>", dim) } else { Span::raw(taints.join(", ")) }),
         field("Created", Span::raw(crate::created_text(&o.metadata))),
         field("UID", Span::raw(o.metadata.uid.clone().unwrap_or_default())),
@@ -198,9 +221,11 @@ mod tests {
         assert_eq!(status(&n), "Ready,SchedulingDisabled");
         assert_eq!((c.ip.as_str(), c.version.as_str(), c.os.as_str()), ("10.0.0.5", "v1.30.2", "Ubuntu 24.04 LTS"));
         assert_eq!((c.cpu_alloc, c.mem_alloc), (Some(3920), Some(7900 << 20)));
-        let rows = info_rows(&n, Some(&Usage { cpu: 392, mem: 790 << 20 }), 12);
-        assert!(rows.iter().any(|l| l.to_string().contains("(10%)")));
-        assert!(rows.iter().any(|l| l.to_string().contains("12 / allocatable 110")));
+        let x = extra(&n, Some(&Usage { cpu: 392, mem: 790 << 20 }), 12);
+        assert!((x.bars[0].ratio - 0.1).abs() < 0.001);
+        assert_eq!(x.bars[2].detail, "12/110");
+        assert_eq!(x.conditions.iter().map(|c| c.ok).collect::<Vec<_>>(), vec![true, true]); // no memory pressure, Ready
+        assert!(info_rows(&n).iter().any(|l| l.to_string().contains("10.0.0.5")));
         assert_eq!((c.pods, c.pods_alloc), (12, Some(110)));
     }
 }

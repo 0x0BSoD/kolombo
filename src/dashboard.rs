@@ -62,6 +62,7 @@ pub struct Snapshot {
     pub pods: (u64, u64), // holding a slot, slots the nodes offer
     pub workloads: Vec<(&'static str, usize, usize)>, // label, ready, total
     pub events: Vec<Ev>,
+    pub images: Vec<(String, usize)>, // image, pods running it
     pub pod_history: Vec<u64>, // ready pods, one sample per poll while the dashboard is open
 }
 
@@ -165,6 +166,7 @@ fn summarize(raw: &Raw, errors: Vec<String>) -> Snapshot {
             ("DaemonSets", ds, raw.daemonsets.len()),
         ],
         events,
+        images: crate::images::counts(&raw.pods),
         pod_history: vec![],
     }
 }
@@ -242,6 +244,10 @@ impl Dashboard {
         draw(frame, area, &s, info, status, &mut self.view);
     }
 
+    pub fn images(&self) -> Vec<(String, usize)> {
+        self.snap.lock().unwrap().images.clone()
+    }
+
     /// Move the event highlight.
     pub fn step(&mut self, delta: isize) {
         let s = self.snap.lock().unwrap();
@@ -316,7 +322,7 @@ fn render_cluster(frame: &mut Frame, area: Rect, s: &Snapshot, info: &HeaderInfo
 }
 
 /// Label and numbers on one line, a bar below. `█` is use, `▓` what pods only request, `░` free.
-fn meter(frame: &mut Frame, area: Rect, label: &str, detail: &str, used: f64, requested: f64, color: Color) {
+pub(crate) fn meter(frame: &mut Frame, area: Rect, label: &str, detail: &str, used: f64, requested: f64, color: Color) {
     let [head, bar] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     let bold = Style::new().fg(color).add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(Span::styled(label.to_string(), bold)), head);

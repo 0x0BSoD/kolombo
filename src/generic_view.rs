@@ -42,6 +42,7 @@ pub enum Action {
     Edit(String),
     Scale(String),   // list key: ask for a replica count
     Restart(String), // list key: ask to roll the pods
+    Images { title: String, rows: Vec<(String, usize)> }, // `i` on a node: images its pods run
 }
 
 /// Hides every object that is not a child of the one we drilled down from. Done on our side because
@@ -124,14 +125,14 @@ fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>
 
 fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usage>, pods: usize) -> Details {
     if nodes::is_nodes(info) {
-        return Details { meta: o.metadata.clone(), info: nodes::info_rows(o, usage, pods), pod: None };
+        return Details { meta: o.metadata.clone(), info: nodes::info_rows(o), pod: None, node: Some(nodes::extra(o, usage, pods)) };
     }
     if let Some(w) = panes::kind_of(info) {
         let mut rows = panes::info_rows(w, o);
         if let Some(ns) = o.namespace() {
             rows.insert(0, field("Namespace", Span::raw(ns)));
         }
-        return Details { meta: o.metadata.clone(), info: rows, pod: None };
+        return Details { meta: o.metadata.clone(), info: rows, pod: None, node: None };
     }
     let mut rows = vec![field("Kind", Span::raw(format!("{} ({})", info.kind, info.api_version())))];
     if let Some(ns) = o.namespace() {
@@ -143,7 +144,7 @@ fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usag
     }
     rows.push(field("Created", Span::raw(created_text(&o.metadata))));
     rows.push(field("UID", Span::raw(o.metadata.uid.clone().unwrap_or_default())));
-    Details { meta: o.metadata.clone(), info: rows, pod: None }
+    Details { meta: o.metadata.clone(), info: rows, pod: None, node: None }
 }
 
 impl GenericView {
@@ -362,6 +363,11 @@ impl GenericView {
                 KeyCode::Char('s') if self.scalable() => return Some(Action::Scale(k)),
                 KeyCode::Char('R') if self.restartable() => return Some(Action::Restart(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
+                KeyCode::Char('i') if node => {
+                    let on_node = |p: &&Arc<Pod>| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(k.as_str());
+                    let pods = self.pods.as_ref().map(|s| s.state()).unwrap_or_default();
+                    return Some(Action::Images { title: format!("Images on {k}"), rows: crate::images::counts(pods.iter().filter(on_node).map(|p| &**p)) });
+                }
                 KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
                 KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
                 KeyCode::Char('u') if node => return Some(Action::Uncordon(k)),
