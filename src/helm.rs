@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Cell, Row, Table, TableState},
 };
 use std::{
     collections::HashMap,
@@ -184,7 +184,7 @@ impl HelmView {
             (s.releases.clone(), s.error.clone(), s.ready)
         };
         if !ready {
-            return frame.render_widget(Paragraph::new("loading helm releases…").style(dim), area);
+            return crate::spinner::render(frame, area, "loading helm releases…");
         }
         let now = jiff::Timestamp::now().as_second();
         let rows: Vec<Row> = releases

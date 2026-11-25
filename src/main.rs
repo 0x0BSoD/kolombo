@@ -11,6 +11,7 @@ mod nodes;
 mod core_panes;
 mod panes;
 mod resources;
+mod spinner;
 mod state;
 mod tree_view;
 mod yaml_view;
@@ -2102,7 +2103,7 @@ fn run_app(
         })?;
 
         // Wait up to 250ms for a key; on timeout loop again so the UI redraws with fresh data.
-        let wait = if activity.items.is_empty() { 250 } else { 80 }; // redraw faster while animating
+        let wait = 80; // fast enough for the loading wheel too
         if !event::poll(Duration::from_millis(wait))? {
             continue;
         }

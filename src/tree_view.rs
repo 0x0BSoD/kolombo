@@ -414,10 +414,9 @@ impl TreeView {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, status: &str) {
-        let dim = Style::new().fg(Color::DarkGray);
         let guard = self.shared.lock().unwrap().clone();
         match guard {
-            None => frame.render_widget(Paragraph::new("loading resource tree…").style(dim), area),
+            None => crate::spinner::render(frame, area, "loading resource tree…"),
             Some(Err(e)) => frame.render_widget(Paragraph::new(format!("cannot build the tree: {e}")).style(Style::new().fg(Color::Red)), area),
             Some(Ok(t)) => draw(frame, area, &t, &self.folded, &mut self.cursor, &mut self.state, status),
         }

@@ -264,7 +264,7 @@ const SELECTED: Color = Color::Rgb(60, 50, 120);
 
 fn draw(frame: &mut Frame, area: Rect, s: &Snapshot, info: &HeaderInfo, status: &str, view: &mut View) {
     if !s.ready {
-        frame.render_widget(Paragraph::new("loading cluster…").style(Style::new().fg(Color::DarkGray)), area);
+        crate::spinner::render(frame, area, "loading cluster…");
         return;
     }
     let [top, mid, bottom] = Layout::vertical([Constraint::Length(4), Constraint::Length(7), Constraint::Fill(1)]).areas(area);
