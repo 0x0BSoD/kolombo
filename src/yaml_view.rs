@@ -2,8 +2,8 @@
 
 use ratatui::{
     Frame,
-    layout::Rect,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
@@ -12,8 +12,14 @@ use serde_yaml_ng::Value;
 use std::collections::HashSet;
 
 /// metadata keys the API server fills in; hidden until `s`.
-const SERVICE_METADATA: [&str; 6] =
-    ["managedFields", "resourceVersion", "uid", "generation", "creationTimestamp", "selfLink"];
+const SERVICE_METADATA: [&str; 6] = [
+    "managedFields",
+    "resourceVersion",
+    "uid",
+    "generation",
+    "creationTimestamp",
+    "selfLink",
+];
 const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
 
 /// What the main loop must do after a key.
@@ -74,7 +80,11 @@ fn to_lines(value: &Value, show_all: bool) -> Vec<String> {
             }
         }
     }
-    serde_yaml_ng::to_string(&v).unwrap_or_default().lines().map(String::from).collect()
+    serde_yaml_ng::to_string(&v)
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
 }
 
 /// `key: value` -> (key, value). None for plain/quoted scalars and list items.
@@ -92,7 +102,11 @@ fn value_style(v: &str) -> Style {
     let color = match v {
         "true" | "false" => Color::Magenta,
         "null" | "~" => Color::DarkGray,
-        _ if v.starts_with(|c: char| c.is_ascii_digit() || c == '-') && v.parse::<f64>().is_ok() => Color::Yellow,
+        _ if v.starts_with(|c: char| c.is_ascii_digit() || c == '-')
+            && v.parse::<f64>().is_ok() =>
+        {
+            Color::Yellow
+        }
         _ => Color::Green,
     };
     Style::new().fg(color)
@@ -109,7 +123,10 @@ fn highlight(line: &str) -> Vec<Span<'static>> {
     }
     match split_key(rest) {
         Some((key, val)) => {
-            spans.push(Span::styled(format!("{key}:"), Style::new().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                format!("{key}:"),
+                Style::new().fg(Color::Cyan),
+            ));
             if !val.is_empty() {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(val.to_string(), value_style(val)));
@@ -123,7 +140,17 @@ fn highlight(line: &str) -> Vec<Span<'static>> {
 impl YamlView {
     pub fn new(name: String, value: Value) -> Self {
         let lines = to_lines(&value, false);
-        Self { name, value, show_all: false, lines, folded: HashSet::new(), cursor: 0, scroll: 0, height: 0, anchor: None }
+        Self {
+            name,
+            value,
+            show_all: false,
+            lines,
+            folded: HashSet::new(),
+            cursor: 0,
+            scroll: 0,
+            height: 0,
+            anchor: None,
+        }
     }
 
     /// Indexes of lines on screen: children of folded blocks are skipped.
@@ -132,7 +159,11 @@ impl YamlView {
         let mut i = 0;
         while i < self.lines.len() {
             out.push(i);
-            i = if self.folded.contains(&i) { block_end(&self.lines, i) } else { i + 1 };
+            i = if self.folded.contains(&i) {
+                block_end(&self.lines, i)
+            } else {
+                i + 1
+            };
         }
         out
     }
@@ -142,7 +173,11 @@ impl YamlView {
         let c = vis.get(self.cursor).copied().unwrap_or(0);
         let a = self.anchor.unwrap_or(c);
         let (lo, hi) = (a.min(c), a.max(c));
-        let end = if self.folded.contains(&hi) { block_end(&self.lines, hi) } else { hi + 1 };
+        let end = if self.folded.contains(&hi) {
+            block_end(&self.lines, hi)
+        } else {
+            hi + 1
+        };
         (lo, end.min(self.lines.len()))
     }
 
@@ -178,7 +213,10 @@ impl YamlView {
                 let mut spans = vec![Span::styled(marker, dim)];
                 spans.extend(highlight(&self.lines[i]));
                 if folded {
-                    spans.push(Span::styled(format!(" … {} lines", block_end(&self.lines, i) - i - 1), dim));
+                    spans.push(Span::styled(
+                        format!(" … {} lines", block_end(&self.lines, i) - i - 1),
+                        dim,
+                    ));
                 }
                 let mut line = Line::from(spans);
                 if pos == self.cursor {
@@ -237,7 +275,11 @@ impl YamlView {
                 self.scroll = 0;
             }
             KeyCode::Char('v' | 'V') => {
-                self.anchor = if self.anchor.is_some() { None } else { vis.get(self.cursor).copied() };
+                self.anchor = if self.anchor.is_some() {
+                    None
+                } else {
+                    vis.get(self.cursor).copied()
+                };
             }
             KeyCode::Char('y') => {
                 let (lo, end) = self.range(&vis);
@@ -260,7 +302,9 @@ mod tests {
 
     #[test]
     fn folds_keys_with_same_indent_list_items() {
-        let l: Vec<String> = ["a:", "  b: 1", "c:", "- x", "- y", "d: 2"].map(String::from).to_vec();
+        let l: Vec<String> = ["a:", "  b: 1", "c:", "- x", "- y", "d: 2"]
+            .map(String::from)
+            .to_vec();
         assert_eq!(block_end(&l, 0), 2);
         assert_eq!(block_end(&l, 2), 5);
         assert_eq!(block_end(&l, 5), 6);

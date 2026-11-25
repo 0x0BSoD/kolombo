@@ -41,7 +41,9 @@ pub fn decode(raw: &[u8]) -> Result<Value, String> {
     let packed = STANDARD.decode(raw).map_err(|e| format!("base64: {e}"))?;
     let json = if packed.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
-        GzDecoder::new(packed.as_slice()).read_to_end(&mut out).map_err(|e| format!("gzip: {e}"))?;
+        GzDecoder::new(packed.as_slice())
+            .read_to_end(&mut out)
+            .map_err(|e| format!("gzip: {e}"))?;
         out
     } else {
         packed
@@ -57,7 +59,10 @@ fn release_from(secret: &Secret) -> Option<Release> {
     let raw = &secret.data.as_ref()?.get("release")?.0;
     let r = decode(raw).ok()?;
     let meta = &r["chart"]["metadata"];
-    let updated = r["info"]["last_deployed"].as_str().and_then(|t| t.parse::<jiff::Timestamp>().ok()).map(|t| t.as_second());
+    let updated = r["info"]["last_deployed"]
+        .as_str()
+        .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+        .map(|t| t.as_second());
     Some(Release {
         name: text(&r["name"]),
         ns: secret.namespace().unwrap_or_default(),
@@ -72,15 +77,24 @@ fn release_from(secret: &Secret) -> Option<Release> {
 }
 
 fn revision_label(s: &Secret) -> u32 {
-    s.labels().get("version").and_then(|v| v.parse().ok()).unwrap_or(0)
+    s.labels()
+        .get("version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The newest revision of each release (by the `version` label), decoded, sorted by namespace and name.
 pub fn latest(secrets: &[Secret]) -> Vec<Release> {
     let mut newest: HashMap<(String, String), &Secret> = HashMap::new();
     for s in secrets {
-        let key = (s.namespace().unwrap_or_default(), s.labels().get("name").cloned().unwrap_or_default());
-        if newest.get(&key).is_none_or(|old| revision_label(old) < revision_label(s)) {
+        let key = (
+            s.namespace().unwrap_or_default(),
+            s.labels().get("name").cloned().unwrap_or_default(),
+        );
+        if newest
+            .get(&key)
+            .is_none_or(|old| revision_label(old) < revision_label(s))
+        {
             newest.insert(key, s);
         }
     }
@@ -132,25 +146,46 @@ impl HelmView {
         let (out, client) = (snap.clone(), client.clone());
         let task = rt.spawn(async move {
             loop {
-                let found = Api::<Secret>::all(client.clone()).list(&ListParams::default().labels("owner=helm")).await;
+                let found = Api::<Secret>::all(client.clone())
+                    .list(&ListParams::default().labels("owner=helm"))
+                    .await;
                 *out.lock().unwrap() = match found {
                     // decoding gunzips every newest revision: keep it off the UI thread
-                    Ok(list) => Snapshot { ready: true, error: None, releases: tokio::task::spawn_blocking(move || latest(&list.items)).await.unwrap_or_default() },
-                    Err(e) => Snapshot { ready: true, error: Some(e.to_string()), releases: vec![] },
+                    Ok(list) => Snapshot {
+                        ready: true,
+                        error: None,
+                        releases: tokio::task::spawn_blocking(move || latest(&list.items))
+                            .await
+                            .unwrap_or_default(),
+                    },
+                    Err(e) => Snapshot {
+                        ready: true,
+                        error: Some(e.to_string()),
+                        releases: vec![],
+                    },
                 };
                 tokio::time::sleep(Duration::from_secs(crate::POLL_SECS)).await;
             }
         });
-        Self { snap, task, table: TableState::default(), selected: None }
+        Self {
+            snap,
+            task,
+            table: TableState::default(),
+            selected: None,
+        }
     }
 
     fn index(&self, rels: &[Release]) -> usize {
-        self.selected.as_ref().and_then(|(ns, n)| rels.iter().position(|r| &r.ns == ns && &r.name == n)).unwrap_or(0)
+        self.selected
+            .as_ref()
+            .and_then(|(ns, n)| rels.iter().position(|r| &r.ns == ns && &r.name == n))
+            .unwrap_or(0)
     }
 
     fn step(&mut self, delta: isize) {
         let rels = self.snap.lock().unwrap().releases.clone();
-        let to = (self.index(&rels) as isize + delta).clamp(0, rels.len().saturating_sub(1) as isize) as usize;
+        let to = (self.index(&rels) as isize + delta)
+            .clamp(0, rels.len().saturating_sub(1) as isize) as usize;
         self.selected = rels.get(to).map(|r| (r.ns.clone(), r.name.clone()));
     }
 
@@ -167,7 +202,14 @@ impl HelmView {
                 let rels = self.snap.lock().unwrap().releases.clone();
                 let r = rels.get(self.index(&rels))?;
                 return Some(if key.code == KeyCode::Enter {
-                    Act::Tree(Source::Helm { ns: r.ns.clone(), name: r.name.clone(), chart: r.chart.clone(), status: r.status.clone(), revision: r.revision, manifest: r.manifest.clone() })
+                    Act::Tree(Source::Helm {
+                        ns: r.ns.clone(),
+                        name: r.name.clone(),
+                        chart: r.chart.clone(),
+                        status: r.status.clone(),
+                        revision: r.revision,
+                        manifest: r.manifest.clone(),
+                    })
                 } else {
                     Act::Values(format!("{}/{} values", r.ns, r.name), r.values.clone())
                 });
@@ -194,7 +236,10 @@ impl HelmView {
                     Cell::from(r.name.clone()),
                     Cell::from(r.ns.clone()),
                     Cell::from(r.revision.to_string()),
-                    Cell::from(Span::styled(r.status.clone(), Style::new().fg(status_color(&r.status)))),
+                    Cell::from(Span::styled(
+                        r.status.clone(),
+                        Style::new().fg(status_color(&r.status)),
+                    )),
                     Cell::from(r.chart.clone()),
                     Cell::from(r.app_version.clone()),
                     Cell::from(crate::format_age(now - r.updated)),
@@ -210,7 +255,16 @@ impl HelmView {
             Constraint::Length(14),
             Constraint::Length(7),
         ];
-        let header = Row::new(["NAME", "NAMESPACE", "REV", "STATUS", "CHART", "APP VERSION", "UPDATED"]).style(dim);
+        let header = Row::new([
+            "NAME",
+            "NAMESPACE",
+            "REV",
+            "STATUS",
+            "CHART",
+            "APP VERSION",
+            "UPDATED",
+        ])
+        .style(dim);
         let mut title = format!(" Helm releases ({}) ", releases.len());
         if let Some(e) = &error {
             title = format!(" Helm releases · cannot list secrets: {e} ");
@@ -222,7 +276,10 @@ impl HelmView {
         let at = self.index(&releases);
         self.selected = releases.get(at).map(|r| (r.ns.clone(), r.name.clone()));
         self.table.select((!releases.is_empty()).then_some(at));
-        let table = Table::new(rows, widths).header(header).block(block).row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(table, area, &mut self.table);
     }
 }
@@ -262,7 +319,15 @@ mod tests {
         let rels = latest(&secrets);
         assert_eq!(rels.len(), 2);
         let shop = rels.iter().find(|r| r.name == "shop").unwrap();
-        assert_eq!((shop.revision, shop.status.as_str(), shop.chart.as_str(), shop.app_version.as_str()), (3, "deployed", "shop-1.2.0", "9.9"));
+        assert_eq!(
+            (
+                shop.revision,
+                shop.status.as_str(),
+                shop.chart.as_str(),
+                shop.app_version.as_str()
+            ),
+            (3, "deployed", "shop-1.2.0", "9.9")
+        );
         assert_eq!(shop.updated, 1767225600);
         assert!(shop.manifest.contains("kind: Service"));
         assert_eq!(shop.values["replicas"], 2);

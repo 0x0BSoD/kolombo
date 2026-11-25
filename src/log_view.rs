@@ -19,7 +19,14 @@ use tokio::{runtime::Handle, task::JoinHandle};
 
 const CAP: usize = 20_000; // lines kept; the oldest go first
 const RETRY: Duration = Duration::from_secs(3);
-const PALETTE: [Color; 6] = [Color::Cyan, Color::Magenta, Color::Yellow, Color::Green, Color::Blue, Color::LightRed];
+const PALETTE: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Green,
+    Color::Blue,
+    Color::LightRed,
+];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Range {
@@ -45,14 +52,26 @@ struct Buf {
 fn parse(container: usize, raw: &str) -> LogLine {
     let (stamp, text) = raw.split_once(' ').unwrap_or((raw, ""));
     match stamp.parse::<Timestamp>() {
-        Ok(t) => LogLine { ts: t.as_nanosecond(), clock: t.strftime("%H:%M:%S").to_string(), container, text: text.to_string(), note: false },
+        Ok(t) => LogLine {
+            ts: t.as_nanosecond(),
+            clock: t.strftime("%H:%M:%S").to_string(),
+            container,
+            text: text.to_string(),
+            note: false,
+        },
         Err(_) => note_or_plain(container, raw, false),
     }
 }
 
 fn note_or_plain(container: usize, text: &str, note: bool) -> LogLine {
     let now = Timestamp::now();
-    LogLine { ts: now.as_nanosecond(), clock: now.strftime("%H:%M:%S").to_string(), container, text: text.to_string(), note }
+    LogLine {
+        ts: now.as_nanosecond(),
+        clock: now.strftime("%H:%M:%S").to_string(),
+        container,
+        text: text.to_string(),
+        note,
+    }
 }
 
 fn push(shared: &Mutex<Buf>, line: LogLine) {
@@ -70,11 +89,23 @@ fn push(shared: &Mutex<Buf>, line: LogLine) {
 
 /// Follow one container forever: reconnects after the stream ends or fails (restart, still
 /// starting), asking only for lines newer than the last one seen.
-async fn follow(api: Api<Pod>, pod: String, container: String, index: usize, range: Range, shared: Arc<Mutex<Buf>>) {
+async fn follow(
+    api: Api<Pod>,
+    pod: String,
+    container: String,
+    index: usize,
+    range: Range,
+    shared: Arc<Mutex<Buf>>,
+) {
     let mut last: Option<i128> = None;
     let mut last_note = String::new();
     loop {
-        let mut lp = LogParams { container: Some(container.clone()), follow: true, timestamps: true, ..Default::default() };
+        let mut lp = LogParams {
+            container: Some(container.clone()),
+            follow: true,
+            timestamps: true,
+            ..Default::default()
+        };
         match (last, range) {
             (Some(t), _) => lp.since_time = Timestamp::from_nanosecond(t + 1).ok(),
             (None, Range::Minutes(m)) => lp.since_seconds = Some(m * 60),
@@ -118,7 +149,7 @@ pub struct LogView {
     range: Range,
     follow: bool, // "autoscroll"
     wrap: bool,
-    full: bool, // bare text over the whole screen, for copy-paste
+    full: bool,     // bare text over the whole screen, for copy-paste
     top: usize,     // first shown line while not following
     hscroll: usize, // columns skipped when not wrapping
     height: usize,  // body rows, learned at render time
@@ -163,7 +194,11 @@ impl LogView {
             .map(|i| {
                 // `self.pod` may be a `namespace/name` list key; the API wants the bare name.
                 let pod = self.pod.rsplit('/').next().unwrap_or(&self.pod).to_string();
-                let (api, name, shared) = (self.api.clone(), self.containers[i].clone(), self.shared.clone());
+                let (api, name, shared) = (
+                    self.api.clone(),
+                    self.containers[i].clone(),
+                    self.shared.clone(),
+                );
                 let range = self.range;
                 self.rt.spawn(follow(api, pod, name, i, range, shared))
             })
@@ -220,7 +255,9 @@ impl LogView {
             KeyCode::Char('g') => self.scroll_to(0, last),
             KeyCode::Char('G') => self.follow = true,
             KeyCode::Char('l') | KeyCode::Right if !self.wrap => self.hscroll += 8,
-            KeyCode::Char('h') | KeyCode::Left if !self.wrap => self.hscroll = self.hscroll.saturating_sub(8),
+            KeyCode::Char('h') | KeyCode::Left if !self.wrap => {
+                self.hscroll = self.hscroll.saturating_sub(8)
+            }
             KeyCode::Esc | KeyCode::Char('q') => return true,
             _ => {}
         }
@@ -231,9 +268,24 @@ impl LogView {
         let border = if self.full { 0 } else { 2 };
         self.height = area.height.saturating_sub(border).max(1) as usize;
         let multi = self.containers.len() > 1;
-        let name_w = if multi { self.containers.iter().map(|c| c.chars().count()).max().unwrap_or(0) } else { 0 };
+        let name_w = if multi {
+            self.containers
+                .iter()
+                .map(|c| c.chars().count())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (border, bare) = if self.full { (0, true) } else { (2, false) };
-        let fmt = Fmt { wrap: self.wrap, hscroll: self.hscroll, width: area.width.saturating_sub(border) as usize, multi, name_w, bare };
+        let fmt = Fmt {
+            wrap: self.wrap,
+            hscroll: self.hscroll,
+            width: area.width.saturating_sub(border) as usize,
+            multi,
+            name_w,
+            bare,
+        };
 
         let buf = self.shared.lock().unwrap();
         let n = buf.lines.len();
@@ -268,7 +320,16 @@ impl LogView {
         }
         let dim = Style::new().fg(Color::DarkGray);
         let on = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
-        let choice = |label: &str, range: Range| Span::styled(format!(" {label} "), if self.range == range { on.add_modifier(Modifier::REVERSED) } else { dim });
+        let choice = |label: &str, range: Range| {
+            Span::styled(
+                format!(" {label} "),
+                if self.range == range {
+                    on.add_modifier(Modifier::REVERSED)
+                } else {
+                    dim
+                },
+            )
+        };
         let title = Line::from(vec![
             Span::raw(" Logs "),
             choice("1:1m", Range::Minutes(1)),
@@ -277,12 +338,30 @@ impl LogView {
             choice("0:all", Range::All),
         ]);
         let flag = |name: &str, on_: bool| {
-            if on_ { Span::styled(format!(" {name} ● "), Style::new().fg(Color::Green)) } else { Span::styled(format!(" {name} ○ "), dim) }
+            if on_ {
+                Span::styled(format!(" {name} ● "), Style::new().fg(Color::Green))
+            } else {
+                Span::styled(format!(" {name} ○ "), dim)
+            }
         };
-        let tags = Line::from(vec![flag("autoscroll", self.follow), flag("wrap", self.wrap), Span::styled(format!(" {n} lines · UTC "), dim)]).right_aligned();
-        let body = if rows.is_empty() { vec![Line::styled("no lines in this range yet…", dim)] } else { rows };
+        let tags = Line::from(vec![
+            flag("autoscroll", self.follow),
+            flag("wrap", self.wrap),
+            Span::styled(format!(" {n} lines · UTC "), dim),
+        ])
+        .right_aligned();
+        let body = if rows.is_empty() {
+            vec![Line::styled("no lines in this range yet…", dim)]
+        } else {
+            rows
+        };
         frame.render_widget(
-            Paragraph::new(body).block(Block::bordered().title(title).title(tags).title_bottom(format!(" {message} "))),
+            Paragraph::new(body).block(
+                Block::bordered()
+                    .title(title)
+                    .title(tags)
+                    .title_bottom(format!(" {message} ")),
+            ),
             area,
         );
     }
@@ -309,10 +388,17 @@ impl Fmt {
     fn rows(&self, l: &LogLine, names: &[String]) -> Vec<Line<'static>> {
         let dim = Style::new().fg(Color::DarkGray);
         let text = clean(&l.text);
-        let mut head = if self.bare { vec![] } else { vec![Span::styled(format!("{} ", l.clock), dim)] };
+        let mut head = if self.bare {
+            vec![]
+        } else {
+            vec![Span::styled(format!("{} ", l.clock), dim)]
+        };
         if self.multi && !self.bare {
             let color = PALETTE[l.container % PALETTE.len()];
-            head.push(Span::styled(format!("{:<w$} ", names[l.container], w = self.name_w), Style::new().fg(color)));
+            head.push(Span::styled(
+                format!("{:<w$} ", names[l.container], w = self.name_w),
+                Style::new().fg(color),
+            ));
         }
         let style = text_style(&text, l.note);
         if !self.wrap {
@@ -366,10 +452,18 @@ fn clean(s: &str) -> String {
 
 fn text_style(t: &str, note: bool) -> Style {
     if note {
-        return Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+        return Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
     }
     let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
-    if has(&["ERROR", "FATAL", "level=error", "\"level\":\"error\"", "panic:"]) {
+    if has(&[
+        "ERROR",
+        "FATAL",
+        "level=error",
+        "\"level\":\"error\"",
+        "panic:",
+    ]) {
         Style::new().fg(Color::Red)
     } else if has(&["WARN", "level=warn", "\"level\":\"warn"]) {
         Style::new().fg(Color::Yellow)
@@ -391,7 +485,13 @@ mod tests {
         let shared = Mutex::new(Buf::default());
         push(&shared, a);
         push(&shared, b);
-        let texts: Vec<_> = shared.lock().unwrap().lines.iter().map(|l| l.text.clone()).collect();
+        let texts: Vec<_> = shared
+            .lock()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
         assert_eq!(texts, ["first", "second"]);
     }
 
@@ -404,14 +504,36 @@ mod tests {
     fn wrap_continues_under_the_text_and_names_show_for_many_containers() {
         let line = parse(1, "2026-11-23T10:00:00Z 0123456789abcdefghij");
         let names = vec!["web".to_string(), "sidecar".to_string()];
-        let f = Fmt { wrap: true, hscroll: 0, width: 9 + 8 + 10, multi: true, name_w: 7, bare: false };
+        let f = Fmt {
+            wrap: true,
+            hscroll: 0,
+            width: 9 + 8 + 10,
+            multi: true,
+            name_w: 7,
+            bare: false,
+        };
         let rows = f.rows(&line, &names);
-        let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
         assert_eq!(rows.len(), 2);
         assert_eq!(text(&rows[0]), "10:00:00 sidecar 0123456789");
         assert_eq!(text(&rows[1]), "                 abcdefghij");
 
-        let bare = Fmt { bare: true, width: 10, ..f };
-        assert_eq!(bare.rows(&line, &names).iter().map(text).collect::<Vec<_>>(), ["0123456789", "abcdefghij"]);
+        let bare = Fmt {
+            bare: true,
+            width: 10,
+            ..f
+        };
+        assert_eq!(
+            bare.rows(&line, &names)
+                .iter()
+                .map(text)
+                .collect::<Vec<_>>(),
+            ["0123456789", "abcdefghij"]
+        );
     }
 }

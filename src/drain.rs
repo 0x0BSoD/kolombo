@@ -1,7 +1,10 @@
 //! Cordon, uncordon and drain, with the same rules as `kubectl drain`.
 
 use futures::future::join_all;
-use k8s_openapi::{api::core::v1::{Node, Pod}, serde_json::json};
+use k8s_openapi::{
+    api::core::v1::{Node, Pod},
+    serde_json::json,
+};
 use kube::{
     Api, Client, ResourceExt,
     api::{DeleteParams, EvictParams, ListParams, Patch, PatchParams},
@@ -15,19 +18,27 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 pub struct DrainOpts {
     pub ignore_daemonsets: bool, // --ignore-daemonsets
     pub force: bool,             // --force: also pods that no controller would recreate
-    pub disable_eviction: bool,  // --disable-eviction: delete pods directly, ignoring PodDisruptionBudgets
-    pub delete_emptydir: bool,   // --delete-emptydir-data
+    pub disable_eviction: bool, // --disable-eviction: delete pods directly, ignoring PodDisruptionBudgets
+    pub delete_emptydir: bool,  // --delete-emptydir-data
 }
 
 impl Default for DrainOpts {
     fn default() -> Self {
-        Self { ignore_daemonsets: true, force: false, disable_eviction: false, delete_emptydir: false }
+        Self {
+            ignore_daemonsets: true,
+            force: false,
+            disable_eviction: false,
+            delete_emptydir: false,
+        }
     }
 }
 
 pub async fn set_cordon(client: &Client, node: &str, on: bool) -> Result<(), kube::Error> {
     let patch = Patch::Merge(json!({ "spec": { "unschedulable": on } }));
-    Api::<Node>::all(client.clone()).patch(node, &PatchParams::default(), &patch).await.map(|_| ())
+    Api::<Node>::all(client.clone())
+        .patch(node, &PatchParams::default(), &patch)
+        .await
+        .map(|_| ())
 }
 
 pub async fn cordon_message(client: &Client, node: &str, on: bool) -> String {
@@ -38,7 +49,10 @@ pub async fn cordon_message(client: &Client, node: &str, on: bool) -> String {
 }
 
 fn finished(pod: &Pod) -> bool {
-    matches!(pod.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Succeeded" | "Failed"))
+    matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+        Some("Succeeded" | "Failed")
+    )
 }
 
 /// Which pods to evict, or why the drain must not start. Mirrors kubectl: static (mirror) pods and
@@ -47,11 +61,18 @@ fn finished(pod: &Pod) -> bool {
 pub fn plan(pods: &[Pod], opts: DrainOpts) -> Result<Vec<Pod>, String> {
     let (mut victims, mut refused) = (Vec::new(), Vec::new());
     for pod in pods {
-        if pod.metadata.deletion_timestamp.is_some() || pod.annotations().contains_key("kubernetes.io/config.mirror") {
+        if pod.metadata.deletion_timestamp.is_some()
+            || pod
+                .annotations()
+                .contains_key("kubernetes.io/config.mirror")
+        {
             continue;
         }
         let who = format!("{}/{}", pod.namespace().unwrap_or_default(), pod.name_any());
-        let controller = pod.owner_references().iter().find(|o| o.controller == Some(true));
+        let controller = pod
+            .owner_references()
+            .iter()
+            .find(|o| o.controller == Some(true));
         if controller.is_some_and(|o| o.kind == "DaemonSet") {
             if !opts.ignore_daemonsets {
                 refused.push(format!("{who} (DaemonSet, tick Ignore DaemonSets)"));
@@ -63,7 +84,10 @@ pub fn plan(pods: &[Pod], opts: DrainOpts) -> Result<Vec<Pod>, String> {
                 refused.push(format!("{who} (no controller, tick Force)"));
                 continue;
             }
-            let has_emptydir = pod.spec.as_ref().is_some_and(|s| s.volumes.iter().flatten().any(|v| v.empty_dir.is_some()));
+            let has_emptydir = pod
+                .spec
+                .as_ref()
+                .is_some_and(|s| s.volumes.iter().flatten().any(|v| v.empty_dir.is_some()));
             if has_emptydir && !opts.delete_emptydir {
                 refused.push(format!("{who} (emptyDir data, tick Delete emptyDir data)"));
                 continue;
@@ -74,8 +98,17 @@ pub fn plan(pods: &[Pod], opts: DrainOpts) -> Result<Vec<Pod>, String> {
     if refused.is_empty() {
         Ok(victims)
     } else {
-        let shown = refused.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
-        let more = if refused.len() > 2 { format!(" +{} more", refused.len() - 2) } else { String::new() };
+        let shown = refused
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if refused.len() > 2 {
+            format!(" +{} more", refused.len() - 2)
+        } else {
+            String::new()
+        };
         Err(format!("{shown}{more}"))
     }
 }
@@ -94,14 +127,18 @@ async fn evict_one(client: Client, pod: Pod, opts: DrainOpts) -> Result<(), Stri
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let result = if opts.disable_eviction {
-            api.delete(&name, &DeleteParams::default()).await.map(|_| ())
+            api.delete(&name, &DeleteParams::default())
+                .await
+                .map(|_| ())
         } else {
             api.evict(&name, &EvictParams::default()).await.map(|_| ())
         };
         match result {
             Ok(()) => break,
             Err(e) if code(&e) == Some(404) => return Ok(()), // already gone
-            Err(e) if code(&e) == Some(429) && Instant::now() < deadline => tokio::time::sleep(Duration::from_secs(5)).await,
+            Err(e) if code(&e) == Some(429) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(5)).await
+            }
             Err(e) => return Err(format!("{ns}/{name}: {e}")),
         }
     }
@@ -113,7 +150,10 @@ async fn evict_one(client: Client, pod: Pod, opts: DrainOpts) -> Result<(), Stri
             Err(e) => return Err(format!("{ns}/{name}: {e}")),
         }
     }
-    Err(format!("{ns}/{name}: still terminating after {} min", TIMEOUT.as_secs() / 60))
+    Err(format!(
+        "{ns}/{name}: still terminating after {} min",
+        TIMEOUT.as_secs() / 60
+    ))
 }
 
 /// Cordon, then evict everything `plan` allows. The returned text is for the status line.
@@ -131,11 +171,19 @@ pub async fn drain(client: Client, node: String, opts: DrainOpts) -> String {
         Err(why) => return format!("{node} cordoned, drain refused: {why}"),
     };
     let total = victims.len();
-    let results = join_all(victims.into_iter().map(|p| evict_one(client.clone(), p, opts))).await;
+    let results = join_all(
+        victims
+            .into_iter()
+            .map(|p| evict_one(client.clone(), p, opts)),
+    )
+    .await;
     let failed: Vec<String> = results.into_iter().filter_map(Result::err).collect();
     match failed.first() {
         None => format!("{node} drained ({total} pods)"),
-        Some(first) => format!("{node}: {} of {total} pods not evicted: {first}", failed.len()),
+        Some(first) => format!(
+            "{node}: {} of {total} pods not evicted: {first}",
+            failed.len()
+        ),
     }
 }
 
@@ -148,23 +196,57 @@ mod tests {
     }
 
     fn owned(name: &str, kind: &str) -> Pod {
-        pod(name, &format!(r#", "ownerReferences": [{{"apiVersion": "v1", "kind": "{kind}", "name": "o", "uid": "u", "controller": true}}]"#))
+        pod(
+            name,
+            &format!(
+                r#", "ownerReferences": [{{"apiVersion": "v1", "kind": "{kind}", "name": "o", "uid": "u", "controller": true}}]"#
+            ),
+        )
     }
 
     #[test]
     fn drain_rules_follow_kubectl() {
         let opts = DrainOpts::default();
-        let mirror = pod("static", r#", "annotations": {"kubernetes.io/config.mirror": "x"}"#);
+        let mirror = pod(
+            "static",
+            r#", "annotations": {"kubernetes.io/config.mirror": "x"}"#,
+        );
         let plain = pod("bare", "");
         let ds = owned("ds", "DaemonSet");
         let web = owned("web", "ReplicaSet");
 
         let names = |v: Vec<Pod>| v.iter().map(|p| p.name_any()).collect::<Vec<_>>();
         // DaemonSet and static pods are skipped; a bare pod blocks the drain until Force
-        let err = plan(&[mirror.clone(), ds.clone(), web.clone(), plain.clone()], opts).unwrap_err();
+        let err = plan(
+            &[mirror.clone(), ds.clone(), web.clone(), plain.clone()],
+            opts,
+        )
+        .unwrap_err();
         assert!(err.contains("ns/bare") && err.contains("Force"));
-        assert_eq!(names(plan(&[mirror, ds.clone(), web.clone(), plain.clone()], DrainOpts { force: true, ..opts }).unwrap()), ["web", "bare"]);
-        assert!(plan(&[ds.clone()], DrainOpts { ignore_daemonsets: false, ..opts }).unwrap_err().contains("DaemonSet"));
+        assert_eq!(
+            names(
+                plan(
+                    &[mirror, ds.clone(), web.clone(), plain.clone()],
+                    DrainOpts {
+                        force: true,
+                        ..opts
+                    }
+                )
+                .unwrap()
+            ),
+            ["web", "bare"]
+        );
+        assert!(
+            plan(
+                &[ds.clone()],
+                DrainOpts {
+                    ignore_daemonsets: false,
+                    ..opts
+                }
+            )
+            .unwrap_err()
+            .contains("DaemonSet")
+        );
 
         let mut scratch = owned("scratch", "ReplicaSet");
         scratch.spec.as_mut().unwrap().volumes = Some(vec![k8s_openapi::api::core::v1::Volume {
@@ -172,7 +254,22 @@ mod tests {
             empty_dir: Some(Default::default()),
             ..Default::default()
         }]);
-        assert!(plan(&[scratch.clone()], opts).unwrap_err().contains("emptyDir"));
-        assert_eq!(plan(&[scratch], DrainOpts { delete_emptydir: true, ..opts }).unwrap().len(), 1);
+        assert!(
+            plan(&[scratch.clone()], opts)
+                .unwrap_err()
+                .contains("emptyDir")
+        );
+        assert_eq!(
+            plan(
+                &[scratch],
+                DrainOpts {
+                    delete_emptydir: true,
+                    ..opts
+                }
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 }

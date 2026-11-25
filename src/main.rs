@@ -1,15 +1,15 @@
 mod argo_panes;
 mod batch_panes;
 mod container_view;
+mod core_panes;
 mod dashboard;
-mod images;
 mod drain;
 mod generic_view;
 mod helm;
+mod images;
 mod log_view;
 mod net_panes;
 mod nodes;
-mod core_panes;
 mod panes;
 mod resources;
 mod spinner;
@@ -57,11 +57,25 @@ use yaml_view::{Outcome, YamlView};
 /// Any object type the generic helpers (edit, delete, find) can work with. Typed ones like Pod have
 /// `DynamicType = ()`; an untyped DynamicObject carries its ApiResource there instead.
 trait Kind:
-    Resource<DynamicType: Clone + Eq + Hash> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+    Resource<DynamicType: Clone + Eq + Hash>
+    + Clone
+    + Debug
+    + Serialize
+    + DeserializeOwned
+    + Send
+    + Sync
+    + 'static
 {
 }
 impl<K> Kind for K where
-    K: Resource<DynamicType: Clone + Eq + Hash> + Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+    K: Resource<DynamicType: Clone + Eq + Hash>
+        + Clone
+        + Debug
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static
 {
 }
 
@@ -69,10 +83,10 @@ impl<K> Kind for K where
 struct Item {
     name: String,
     status: String,
-    created: i64,                  // unix seconds
-    labels: Vec<(String, String)>, // user labels only, sorted by key
-    pod: Option<PodCols>,          // pod-only columns; None for namespaces
-    node: Option<nodes::NodeCols>, // node-only columns
+    created: i64,                        // unix seconds
+    labels: Vec<(String, String)>,       // user labels only, sorted by key
+    pod: Option<PodCols>,                // pod-only columns; None for namespaces
+    node: Option<nodes::NodeCols>,       // node-only columns
     extra: Option<Vec<(String, Color)>>, // workload columns, in the order of `panes::columns`
 }
 
@@ -93,13 +107,19 @@ fn labels_of(meta: &ObjectMeta, hide_name: bool) -> Vec<(String, String)> {
 }
 
 fn created_secs(meta: &ObjectMeta) -> i64 {
-    meta.creation_timestamp.as_ref().map_or(0, |t| t.0.as_second())
+    meta.creation_timestamp
+        .as_ref()
+        .map_or(0, |t| t.0.as_second())
 }
 
 fn ns_item(ns: &Namespace) -> Item {
     Item {
         name: ns.name_any(),
-        status: ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default(),
+        status: ns
+            .status
+            .as_ref()
+            .and_then(|s| s.phase.clone())
+            .unwrap_or_default(),
         created: created_secs(&ns.metadata),
         labels: labels_of(&ns.metadata, true),
         pod: None,
@@ -115,7 +135,9 @@ fn pod_status(pod: &Pod) -> String {
     if pod.metadata.deletion_timestamp.is_some() {
         return "Terminating".into();
     }
-    let Some(status) = &pod.status else { return String::new() };
+    let Some(status) = &pod.status else {
+        return String::new();
+    };
     let containers: Vec<_> = status.container_statuses.iter().flatten().collect();
     // `?` inside a closure returns None from the closure, which find_map skips.
     let waiting = containers
@@ -126,7 +148,11 @@ fn pod_status(pod: &Pod) -> String {
     }
     let failed = containers.iter().find_map(|c| {
         let t = c.state.as_ref()?.terminated.as_ref()?;
-        if t.exit_code != 0 { t.reason.clone() } else { None }
+        if t.exit_code != 0 {
+            t.reason.clone()
+        } else {
+            None
+        }
     });
     failed.or_else(|| status.phase.clone()).unwrap_or_default()
 }
@@ -152,7 +178,9 @@ fn pod_restarts(pod: &Pod) -> i32 {
 /// The container kubectl would pick: the `default-container` annotation, else the first one.
 fn default_container(pod: &Pod) -> Option<&Container> {
     let spec = pod.spec.as_ref()?;
-    let wanted = pod.annotations().get("kubectl.kubernetes.io/default-container");
+    let wanted = pod
+        .annotations()
+        .get("kubectl.kubernetes.io/default-container");
     wanted
         .and_then(|n| spec.containers.iter().find(|c| &c.name == n))
         .or(spec.containers.first())
@@ -161,7 +189,9 @@ fn default_container(pod: &Pod) -> Option<&Container> {
 /// `registry.example.com/team/app:1.2` -> `team/app:1.2`, and a long digest cut short.
 fn short_image(image: &str) -> String {
     let image = match image.split_once('/') {
-        Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => rest,
+        Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
+            rest
+        }
         _ => image,
     };
     match image.split_once("@sha256:") {
@@ -181,7 +211,9 @@ fn parse_cpu(q: &str) -> Option<u64> {
     } else {
         (q, 1000.0)
     };
-    num.parse::<f64>().ok().map(|v| (v * per_milli).round() as u64)
+    num.parse::<f64>()
+        .ok()
+        .map(|v| (v * per_milli).round() as u64)
 }
 
 /// Memory quantity ("128Mi", "1G", "1048576") -> bytes.
@@ -222,11 +254,24 @@ fn usage_bar(used: Option<u64>, req: Option<u64>, lim: Option<u64>) -> Line<'sta
         (Some(u), Some(d)) if d > 0 => (u as f64 / d as f64).min(1.0),
         _ => return Line::from(Span::styled("⣀".repeat(BAR_CELLS), track)),
     };
-    let color = if ratio >= 0.9 { Color::Red } else if ratio >= 0.7 { Color::Yellow } else { Color::Green };
+    let color = if ratio >= 0.9 {
+        Color::Red
+    } else if ratio >= 0.7 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
     let dots = (ratio * (BAR_CELLS * 8) as f64).round() as usize;
     let spans = (0..BAR_CELLS).map(|i| {
         let n = dots.saturating_sub(i * 8).min(8);
-        Span::styled(LEVELS[n].to_string(), if n == 0 { track } else { Style::new().fg(color) })
+        Span::styled(
+            LEVELS[n].to_string(),
+            if n == 0 {
+                track
+            } else {
+                Style::new().fg(color)
+            },
+        )
     });
     Line::from(spans.collect::<Vec<_>>())
 }
@@ -247,7 +292,11 @@ fn sum_resource(pod: &Pod, limits: bool, key: &str, parse: fn(&str) -> Option<u6
         .flat_map(|s| &s.containers)
         .filter_map(|c| {
             let r = c.resources.as_ref()?;
-            let map = if limits { r.limits.as_ref() } else { r.requests.as_ref() }?;
+            let map = if limits {
+                r.limits.as_ref()
+            } else {
+                r.requests.as_ref()
+            }?;
             parse(&map.get(key)?.0)
         })
         .reduce(|a, b| a + b)
@@ -257,7 +306,7 @@ fn sum_resource(pod: &Pod, limits: bool, key: &str, parse: fn(&str) -> Option<u6
 struct PodCols {
     ready: String,
     restarts: String,
-    image: String, // of the default container
+    image: String,        // of the default container
     cpu_req: Option<u64>, // millicores, summed over containers
     cpu_lim: Option<u64>,
     mem_req: Option<u64>, // bytes
@@ -269,7 +318,10 @@ fn pod_cols(pod: &Pod) -> PodCols {
     PodCols {
         ready: format!("{ready}/{total}"),
         restarts: pod_restarts(pod).to_string(),
-        image: default_container(pod).and_then(|c| c.image.as_deref()).map(short_image).unwrap_or_default(),
+        image: default_container(pod)
+            .and_then(|c| c.image.as_deref())
+            .map(short_image)
+            .unwrap_or_default(),
         cpu_req: sum_resource(pod, false, "cpu", parse_cpu),
         cpu_lim: sum_resource(pod, true, "cpu", parse_cpu),
         mem_req: sum_resource(pod, false, "memory", parse_mem),
@@ -280,7 +332,11 @@ fn pod_cols(pod: &Pod) -> PodCols {
 /// `all` = the list spans namespaces, so the name alone is not unique: key and shown name are `ns/name`.
 fn pod_item(pod: &Pod, all: bool) -> Item {
     Item {
-        name: if all { format!("{}/{}", pod.namespace().unwrap_or_default(), pod.name_any()) } else { pod.name_any() },
+        name: if all {
+            format!("{}/{}", pod.namespace().unwrap_or_default(), pod.name_any())
+        } else {
+            pod.name_any()
+        },
         status: pod_status(pod),
         created: created_secs(&pod.metadata),
         labels: Vec::new(), // the pod list shows image and resources instead
@@ -313,7 +369,10 @@ type History = HashMap<(String, String), VecDeque<Usage>>;
 
 /// Ask metrics-server (metrics.k8s.io) for every pod of a namespace: pod -> usage per container.
 /// There are no typed structs for it in k8s-openapi, so read it as a dynamic object.
-async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<String, Vec<(String, Usage)>>, kube::Error> {
+async fn fetch_metrics(
+    client: &Client,
+    ns: Option<&str>,
+) -> Result<HashMap<String, Vec<(String, Usage)>>, kube::Error> {
     let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
     let resource = ApiResource::from_gvk_with_plural(&gvk, "pods");
     let api: Api<DynamicObject> = match ns {
@@ -332,11 +391,21 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
                 .flatten()
                 .map(|c| {
                     let cpu = c["usage"]["cpu"].as_str().and_then(parse_cpu).unwrap_or(0);
-                    let mem = c["usage"]["memory"].as_str().and_then(parse_mem).unwrap_or(0);
-                    (c["name"].as_str().unwrap_or_default().to_string(), Usage { cpu, mem })
+                    let mem = c["usage"]["memory"]
+                        .as_str()
+                        .and_then(parse_mem)
+                        .unwrap_or(0);
+                    (
+                        c["name"].as_str().unwrap_or_default().to_string(),
+                        Usage { cpu, mem },
+                    )
                 })
                 .collect();
-            let key = if ns.is_some() { o.name_any() } else { format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any()) };
+            let key = if ns.is_some() {
+                o.name_any()
+            } else {
+                format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any())
+            };
             (key, containers)
         })
         .collect())
@@ -344,10 +413,11 @@ async fn fetch_metrics(client: &Client, ns: Option<&str>) -> Result<HashMap<Stri
 
 fn status_color(s: &str) -> Color {
     match s {
-        "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy" | "Synced" | "Bound"
-        | "Established" | "OK" | "Normal" | "Programmed" | "Accepted" | "Complete" => Color::Green,
-        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating" | "Paused" | "Released" | "Degraded"
-        | "AtLimit" | "Warning" | "Suspended" => Color::Yellow,
+        "Running" | "Active" | "Succeeded" | "Completed" | "Ready" | "Available" | "Healthy"
+        | "Synced" | "Bound" | "Established" | "OK" | "Normal" | "Programmed" | "Accepted"
+        | "Complete" => Color::Green,
+        "Pending" | "Terminating" | "ContainerCreating" | "PodInitializing" | "Updating"
+        | "Paused" | "Released" | "Degraded" | "AtLimit" | "Warning" | "Suspended" => Color::Yellow,
         "ScaledToZero" | "NoNodes" => Color::DarkGray,
         _ if s.starts_with("Init:") || s.contains("SchedulingDisabled") => Color::Yellow,
         _ => Color::Red,
@@ -413,31 +483,60 @@ fn container_rows(pod: &Pod) -> Vec<ContainerRow> {
             };
             let cs = list.and_then(|l| l.iter().find(|s| s.name == c.name));
             let (state, color) = match cs.and_then(|s| s.state.as_ref()) {
-                Some(ContainerState { running: Some(r), .. }) => {
-                    (format!("Running {}", r.started_at.as_ref().map_or(String::new(), ago)), Color::Green)
-                }
-                Some(ContainerState { waiting: Some(w), .. }) => {
+                Some(ContainerState {
+                    running: Some(r), ..
+                }) => (
+                    format!(
+                        "Running {}",
+                        r.started_at.as_ref().map_or(String::new(), ago)
+                    ),
+                    Color::Green,
+                ),
+                Some(ContainerState {
+                    waiting: Some(w), ..
+                }) => {
                     let reason = w.reason.clone().unwrap_or_else(|| "Waiting".into());
                     let color = status_color(&reason);
                     (reason, color)
                 }
-                Some(ContainerState { terminated: Some(t), .. }) => {
+                Some(ContainerState {
+                    terminated: Some(t),
+                    ..
+                }) => {
                     let reason = t.reason.clone().unwrap_or_else(|| "Terminated".into());
-                    (format!("{reason} ({})", t.exit_code), if t.exit_code == 0 { Color::Green } else { Color::Red })
+                    (
+                        format!("{reason} ({})", t.exit_code),
+                        if t.exit_code == 0 {
+                            Color::Green
+                        } else {
+                            Color::Red
+                        },
+                    )
                 }
                 _ => ("-".into(), Color::DarkGray),
             };
             let last = cs
                 .and_then(|s| s.last_state.as_ref()?.terminated.as_ref())
                 .map(|t| {
-                    let when = t.finished_at.as_ref().map_or(String::new(), |t| format!(" {} ago", ago(t)));
-                    format!("{} ({}){when}", t.reason.clone().unwrap_or_default(), t.exit_code)
+                    let when = t
+                        .finished_at
+                        .as_ref()
+                        .map_or(String::new(), |t| format!(" {} ago", ago(t)));
+                    format!(
+                        "{} ({}){when}",
+                        t.reason.clone().unwrap_or_default(),
+                        t.exit_code
+                    )
                 })
                 .unwrap_or_default();
             ContainerRow {
                 raw_name: c.name.clone(),
                 init: is_init,
-                name: if is_init { format!("init:{}", c.name) } else { c.name.clone() },
+                name: if is_init {
+                    format!("init:{}", c.name)
+                } else {
+                    c.name.clone()
+                },
                 state,
                 color,
                 ready: cs.is_some_and(|s| s.ready),
@@ -479,9 +578,15 @@ fn pod_events(pod: &Pod, store: &Store<KubeEvent>) -> Vec<EventRow> {
                 .map(|t| t.0.as_second())
                 .or(e.event_time.as_ref().map(|t| t.0.as_second()))
                 .unwrap_or_else(|| created_secs(&e.metadata));
-            let count = e.count.filter(|c| *c > 1).map_or(String::new(), |c| format!(" (x{c})"));
+            let count = e
+                .count
+                .filter(|c| *c > 1)
+                .map_or(String::new(), |c| format!(" (x{c})"));
             let row = EventRow {
-                age: format!("{}{count}", format_age(jiff::Timestamp::now().as_second() - at)),
+                age: format!(
+                    "{}{count}",
+                    format_age(jiff::Timestamp::now().as_second() - at)
+                ),
                 kind: e.type_.clone().unwrap_or_default(),
                 reason: e.reason.clone().unwrap_or_default(),
                 message: e.message.clone().unwrap_or_default().replace('\n', " "),
@@ -494,7 +599,10 @@ fn pod_events(pod: &Pod, store: &Store<KubeEvent>) -> Vec<EventRow> {
 }
 
 fn field(k: &str, v: Span<'static>) -> Line<'static> {
-    Line::from(vec![Span::styled(format!("{k:<10}"), Style::new().fg(Color::DarkGray)), v])
+    Line::from(vec![
+        Span::styled(format!("{k:<10}"), Style::new().fg(Color::DarkGray)),
+        v,
+    ])
 }
 
 fn status_span(status: &str) -> Span<'static> {
@@ -503,18 +611,29 @@ fn status_span(status: &str) -> Span<'static> {
 
 fn created_text(meta: &ObjectMeta) -> String {
     meta.creation_timestamp.as_ref().map_or(String::new(), |t| {
-        format!("{} ({} ago)", t.0, format_age(jiff::Timestamp::now().as_second() - t.0.as_second()))
+        format!(
+            "{} ({} ago)",
+            t.0,
+            format_age(jiff::Timestamp::now().as_second() - t.0.as_second())
+        )
     })
 }
 
 fn ns_details(ns: &Namespace) -> Details {
-    let status = ns.status.as_ref().and_then(|s| s.phase.clone()).unwrap_or_default();
+    let status = ns
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.clone())
+        .unwrap_or_default();
     Details {
         meta: ns.metadata.clone(),
         info: vec![
             field("Status", status_span(&status)),
             field("Created", Span::raw(created_text(&ns.metadata))),
-            field("UID", Span::raw(ns.metadata.uid.clone().unwrap_or_default())),
+            field(
+                "UID",
+                Span::raw(ns.metadata.uid.clone().unwrap_or_default()),
+            ),
         ],
         pod: None,
         node: None,
@@ -544,9 +663,26 @@ fn pod_details(pod: &Pod, events: &Store<KubeEvent>) -> Details {
             field("Node", text(spec.and_then(|s| s.node_name.as_ref()))),
             field("IP", Span::raw(ips)),
             field("QoS", text(status.and_then(|s| s.qos_class.as_ref()))),
-            field("Account", text(spec.and_then(|s| s.service_account_name.as_ref()))),
-            field("CPU", Span::raw(format!("req {}  limit {}", cpu_text(cols.cpu_req), cpu_text(cols.cpu_lim)))),
-            field("Memory", Span::raw(format!("req {}  limit {}", mem_text(cols.mem_req), mem_text(cols.mem_lim)))),
+            field(
+                "Account",
+                text(spec.and_then(|s| s.service_account_name.as_ref())),
+            ),
+            field(
+                "CPU",
+                Span::raw(format!(
+                    "req {}  limit {}",
+                    cpu_text(cols.cpu_req),
+                    cpu_text(cols.cpu_lim)
+                )),
+            ),
+            field(
+                "Memory",
+                Span::raw(format!(
+                    "req {}  limit {}",
+                    mem_text(cols.mem_req),
+                    mem_text(cols.mem_lim)
+                )),
+            ),
             field("Created", Span::raw(created_text(&pod.metadata))),
         ],
         pod: Some(PodExtra {
@@ -560,25 +696,45 @@ fn pod_details(pod: &Pod, events: &Store<KubeEvent>) -> Details {
 
 /// Key/value table for a labels/annotations map, with a count in the title.
 /// At most `limit` rows (the last one becomes "+N more"); the huge last-applied annotation is skipped.
-fn map_table<'a>(title: &str, map: &'a Option<BTreeMap<String, String>>, limit: usize) -> Table<'a> {
+fn map_table<'a>(
+    title: &str,
+    map: &'a Option<BTreeMap<String, String>>,
+    limit: usize,
+) -> Table<'a> {
     let dim = Style::new().fg(Color::DarkGray);
     let mut rows: Vec<Row> = map
         .iter()
         .flatten()
         .filter(|(k, _)| k.as_str() != "kubectl.kubernetes.io/last-applied-configuration")
-        .map(|(k, v)| Row::new([Cell::from(k.as_str()).style(Style::new().fg(Color::Cyan)), Cell::from(v.as_str())]))
+        .map(|(k, v)| {
+            Row::new([
+                Cell::from(k.as_str()).style(Style::new().fg(Color::Cyan)),
+                Cell::from(v.as_str()),
+            ])
+        })
         .collect();
     let count = rows.len();
     if count > limit {
         rows.truncate(limit.saturating_sub(1));
-        rows.push(Row::new([Cell::from(format!("… +{} more", count + 1 - limit)).style(dim)]));
+        rows.push(Row::new([Cell::from(format!(
+            "… +{} more",
+            count + 1 - limit
+        ))
+        .style(dim)]));
     }
     if rows.is_empty() {
         rows.push(Row::new([Cell::from("<none>").style(dim)]));
     }
     Table::new(rows, [Constraint::Percentage(40), Constraint::Fill(1)])
-        .header(Row::new(["KEY", "VALUE"]).style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow)))
-        .block(Block::bordered().border_style(dim).title(format!(" {title} ({count}) ")))
+        .header(
+            Row::new(["KEY", "VALUE"])
+                .style(Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow)),
+        )
+        .block(
+            Block::bordered()
+                .border_style(dim)
+                .title(format!(" {title} ({count}) ")),
+        )
 }
 
 /// What the header shows about the connection.
@@ -597,9 +753,28 @@ fn current_context() -> String {
 
 type Hints = &'static [(&'static str, &'static str)];
 
-const TREE_HINTS: Hints = &[("j/k", "move"), ("g/G", "top/bottom"), ("Space", "fold"), (":", "resource"), ("Esc", "back"), ("q", "quit")];
-const HELM_HINTS: Hints = &[("Enter", "resource tree"), ("y", "values"), ("j/k", "move"), (":", "resource"), ("Esc", "dashboard"), ("q", "quit")];
-const DASHBOARD_HINTS: Hints = &[("j/k", "select event"), ("i", "images"), (":", "resource"), ("q", "quit")];
+const TREE_HINTS: Hints = &[
+    ("j/k", "move"),
+    ("g/G", "top/bottom"),
+    ("Space", "fold"),
+    (":", "resource"),
+    ("Esc", "back"),
+    ("q", "quit"),
+];
+const HELM_HINTS: Hints = &[
+    ("Enter", "resource tree"),
+    ("y", "values"),
+    ("j/k", "move"),
+    (":", "resource"),
+    ("Esc", "dashboard"),
+    ("q", "quit"),
+];
+const DASHBOARD_HINTS: Hints = &[
+    ("j/k", "select event"),
+    ("i", "images"),
+    (":", "resource"),
+    ("q", "quit"),
+];
 
 const LIST_HINTS: Hints = &[
     ("Enter", "pods"),
@@ -629,9 +804,28 @@ const POD_HINTS: Hints = &[
     ("Esc", "back"),
     ("q", "quit"),
 ];
-const DETAILS_HINTS: Hints = &[("e", "edit"), ("y", "yaml"), ("^n", "new"), ("^d", "delete"), ("Esc", "back")];
-const POD_DETAILS_HINTS: Hints = &[("j/k", "select"), ("Enter", "container"), ("l", "logs"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
-const CONTAINER_HINTS: Hints = &[("j/k", "scroll env"), ("l", "logs"), ("y", "yaml"), ("Esc", "back")];
+const DETAILS_HINTS: Hints = &[
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^n", "new"),
+    ("^d", "delete"),
+    ("Esc", "back"),
+];
+const POD_DETAILS_HINTS: Hints = &[
+    ("j/k", "select"),
+    ("Enter", "container"),
+    ("l", "logs"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("Esc", "back"),
+];
+const CONTAINER_HINTS: Hints = &[
+    ("j/k", "scroll env"),
+    ("l", "logs"),
+    ("y", "yaml"),
+    ("Esc", "back"),
+];
 const LOG_HINTS: Hints = &[
     ("1/2/3/0", "1m/5m/15m/all"),
     ("s", "autoscroll"),
@@ -657,8 +851,17 @@ const NODE_HINTS: Hints = &[
     ("A", "asc/desc"),
     ("Esc", "back"),
 ];
-const NODE_DETAILS_HINTS: Hints =
-    &[("i", "images"), ("c", "cordon"), ("u", "uncordon"), ("C", "drain"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const NODE_DETAILS_HINTS: Hints = &[
+    ("i", "images"),
+    ("c", "cordon"),
+    ("u", "uncordon"),
+    ("C", "drain"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("Esc", "back"),
+];
 // The `_NS` variants are for namespaced types: they also list the namespace picker.
 const WORKLOAD_HINTS_NS: Hints = &[
     ("Enter", "pods"),
@@ -686,8 +889,14 @@ const GENERIC_HINTS_NS: Hints = &[
     ("Esc", "back"),
     ("q", "quit"),
 ];
-const GENERIC_DETAILS_HINTS_NS: Hints =
-    &[("^n", "namespace"), (":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const GENERIC_DETAILS_HINTS_NS: Hints = &[
+    ("^n", "namespace"),
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("Esc", "back"),
+];
 const WORKLOAD_HINTS: Hints = &[
     ("Enter", "pods"),
     ("d", "describe"),
@@ -795,7 +1004,13 @@ const GENERIC_HINTS: Hints = &[
     ("Esc", "back"),
     ("q", "quit"),
 ];
-const GENERIC_DETAILS_HINTS: Hints = &[(":", "resource"), ("e", "edit"), ("y", "yaml"), ("^d", "delete"), ("Esc", "back")];
+const GENERIC_DETAILS_HINTS: Hints = &[
+    (":", "resource"),
+    ("e", "edit"),
+    ("y", "yaml"),
+    ("^d", "delete"),
+    ("Esc", "back"),
+];
 const YAML_HINTS: Hints = &[
     ("j/k", "move"),
     ("g/G", "top/bottom"),
@@ -827,7 +1042,10 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
     ]);
     let right = Line::from(vec![
         Span::styled("k8s ", label),
-        Span::styled(version, bar_style.fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            version,
+            bar_style.fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" ", bar_style),
     ])
     .right_aligned();
@@ -839,7 +1057,11 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
         if i > 0 {
             trail_spans.push(Span::styled(" // ", dim));
         }
-        let style = if i + 1 == crumbs.len() { bold.fg(Color::Cyan) } else { dim };
+        let style = if i + 1 == crumbs.len() {
+            bold.fg(Color::Cyan)
+        } else {
+            dim
+        };
         trail_spans.push(Span::styled(c.clone(), style));
     }
     frame.render_widget(Paragraph::new(Line::from(trail_spans)), trail);
@@ -859,47 +1081,86 @@ fn render_header(frame: &mut Frame, area: Rect, info: &HeaderInfo, crumbs: &[Str
 fn render_details(frame: &mut Frame, area: Rect, d: &Details, sel: &mut TableState, message: &str) {
     let dim = Style::new().fg(Color::DarkGray);
     let head = Style::new().add_modifier(Modifier::BOLD).fg(Color::Yellow);
-    let outer = Block::bordered().title(" Details ").title_bottom(format!(" {message} "));
+    let outer = Block::bordered()
+        .title(" Details ")
+        .title_bottom(format!(" {message} "));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
-    let info_box = Paragraph::new(d.info.clone()).block(Block::bordered().border_style(dim).title(" Info "));
+    let info_box =
+        Paragraph::new(d.info.clone()).block(Block::bordered().border_style(dim).title(" Info "));
 
     if let Some(n) = &d.node {
-        let [top, conds, meta] =
-            Layout::vertical([Constraint::Length(d.info.len().max(6) as u16 + 2), Constraint::Fill(1), Constraint::Length(7)]).areas(inner);
-        let [info, res] = Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
+        let [top, conds, meta] = Layout::vertical([
+            Constraint::Length(d.info.len().max(6) as u16 + 2),
+            Constraint::Fill(1),
+            Constraint::Length(7),
+        ])
+        .areas(inner);
+        let [info, res] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
         frame.render_widget(info_box, info);
         let res_box = Block::bordered().border_style(dim).title(" Resources ");
         let res_inner = res_box.inner(res);
         frame.render_widget(res_box, res);
         let rows = Layout::vertical([Constraint::Length(2); 3]).split(res_inner);
         for (bar, at) in n.bars.iter().zip(rows.iter()) {
-            let color = if bar.ratio >= 0.9 { Color::Red } else if bar.ratio >= 0.7 { Color::Yellow } else { Color::Green };
+            let color = if bar.ratio >= 0.9 {
+                Color::Red
+            } else if bar.ratio >= 0.7 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
             dashboard::meter(frame, *at, bar.label, &bar.detail, bar.ratio, 0.0, color);
         }
         let cond_rows = n.conditions.iter().map(|c| {
-            let mark = if c.ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
-            Row::new([Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])), Cell::from(c.age.clone()), Cell::from(c.reason.clone())])
+            let mark = if c.ok {
+                Span::styled("✓", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("✗", Style::new().fg(Color::Red))
+            };
+            Row::new([
+                Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])),
+                Cell::from(c.age.clone()),
+                Cell::from(c.reason.clone()),
+            ])
         });
         frame.render_widget(
-            Table::new(cond_rows, [Constraint::Length(22), Constraint::Length(6), Constraint::Fill(1)])
-                .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
-                .block(Block::bordered().border_style(dim).title(" Conditions ")),
+            Table::new(
+                cond_rows,
+                [
+                    Constraint::Length(22),
+                    Constraint::Length(6),
+                    Constraint::Fill(1),
+                ],
+            )
+            .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
+            .block(Block::bordered().border_style(dim).title(" Conditions ")),
             conds,
         );
-        let [labels, annotations] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
+        let [labels, annotations] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
         frame.render_widget(map_table("Labels", &d.meta.labels, 4), labels);
-        frame.render_widget(map_table("Annotations", &d.meta.annotations, 4), annotations);
+        frame.render_widget(
+            map_table("Annotations", &d.meta.annotations, 4),
+            annotations,
+        );
         return;
     }
 
     let Some(x) = &d.pod else {
-        let [info, labels, annotations] =
-            Layout::vertical([Constraint::Length(d.info.len() as u16 + 2), Constraint::Fill(1), Constraint::Fill(1)])
-                .areas(inner);
+        let [info, labels, annotations] = Layout::vertical([
+            Constraint::Length(d.info.len() as u16 + 2),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
         frame.render_widget(info_box, info);
         frame.render_widget(map_table("Labels", &d.meta.labels, usize::MAX), labels);
-        frame.render_widget(map_table("Annotations", &d.meta.annotations, usize::MAX), annotations);
+        frame.render_widget(
+            map_table("Annotations", &d.meta.annotations, usize::MAX),
+            annotations,
+        );
         return;
     };
 
@@ -910,39 +1171,74 @@ fn render_details(frame: &mut Frame, area: Rect, d: &Details, sel: &mut TableSta
         Constraint::Length(6),
     ])
     .areas(inner);
-    let [info, conds] = Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
+    let [info, conds] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
     frame.render_widget(info_box, info);
 
     let cond_rows = x.conditions.iter().map(|c| {
-        let mark = if c.ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
-        Row::new([Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])), Cell::from(c.age.clone()), Cell::from(c.reason.clone())])
+        let mark = if c.ok {
+            Span::styled("✓", Style::new().fg(Color::Green))
+        } else {
+            Span::styled("✗", Style::new().fg(Color::Red))
+        };
+        Row::new([
+            Cell::from(Line::from(vec![mark, Span::raw(format!(" {}", c.kind))])),
+            Cell::from(c.age.clone()),
+            Cell::from(c.reason.clone()),
+        ])
     });
     frame.render_widget(
-        Table::new(cond_rows, [Constraint::Length(20), Constraint::Length(6), Constraint::Fill(1)])
-            .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
-            .block(Block::bordered().border_style(dim).title(" Conditions ")),
+        Table::new(
+            cond_rows,
+            [
+                Constraint::Length(20),
+                Constraint::Length(6),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(Row::new(["CONDITION", "AGE", "REASON"]).style(head))
+        .block(Block::bordered().border_style(dim).title(" Conditions ")),
         conds,
     );
 
-    let container_rows: Vec<Row> = x.containers.iter().map(|c| {
-        let ready = if c.ready { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) };
-        Row::new([
-            Cell::from(c.name.clone()),
-            Cell::from(c.state.clone()).style(Style::new().fg(c.color)),
-            Cell::from(ready),
-            Cell::from(c.restarts.to_string()),
-            Cell::from(c.last.clone()),
-            Cell::from(c.image.clone()),
-        ])
-    }).collect();
+    let container_rows: Vec<Row> = x
+        .containers
+        .iter()
+        .map(|c| {
+            let ready = if c.ready {
+                Span::styled("✓", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("✗", Style::new().fg(Color::Red))
+            };
+            Row::new([
+                Cell::from(c.name.clone()),
+                Cell::from(c.state.clone()).style(Style::new().fg(c.color)),
+                Cell::from(ready),
+                Cell::from(c.restarts.to_string()),
+                Cell::from(c.last.clone()),
+                Cell::from(c.image.clone()),
+            ])
+        })
+        .collect();
     frame.render_stateful_widget(
         Table::new(
             container_rows,
-            [Constraint::Fill(2), Constraint::Length(24), Constraint::Length(5), Constraint::Length(8), Constraint::Fill(2), Constraint::Fill(3)],
+            [
+                Constraint::Fill(2),
+                Constraint::Length(24),
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Fill(2),
+                Constraint::Fill(3),
+            ],
         )
         .header(Row::new(["NAME", "STATE", "READY", "RESTARTS", "LAST STATE", "IMAGE"]).style(head))
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .block(Block::bordered().border_style(dim).title(format!(" Containers ({}) ", x.containers.len()))),
+        .block(
+            Block::bordered()
+                .border_style(dim)
+                .title(format!(" Containers ({}) ", x.containers.len())),
+        ),
         containers,
         sel,
     );
@@ -951,24 +1247,49 @@ fn render_details(frame: &mut Frame, area: Rect, d: &Details, sel: &mut TableSta
         .events
         .iter()
         .map(|e| {
-            let color = if e.kind == "Warning" { Color::Red } else { Color::Reset };
-            Row::new([Cell::from(e.age.clone()), Cell::from(e.kind.clone()), Cell::from(e.reason.clone()), Cell::from(e.message.clone())])
-                .style(Style::new().fg(color))
+            let color = if e.kind == "Warning" {
+                Color::Red
+            } else {
+                Color::Reset
+            };
+            Row::new([
+                Cell::from(e.age.clone()),
+                Cell::from(e.kind.clone()),
+                Cell::from(e.reason.clone()),
+                Cell::from(e.message.clone()),
+            ])
+            .style(Style::new().fg(color))
         })
         .collect();
     if event_rows.is_empty() {
         event_rows.push(Row::new([Cell::from("<none>").style(dim)]));
     }
     frame.render_widget(
-        Table::new(event_rows, [Constraint::Length(12), Constraint::Length(8), Constraint::Length(20), Constraint::Fill(1)])
-            .header(Row::new(["AGE", "TYPE", "REASON", "MESSAGE"]).style(head))
-            .block(Block::bordered().border_style(dim).title(format!(" Events ({}) ", x.events.len()))),
+        Table::new(
+            event_rows,
+            [
+                Constraint::Length(12),
+                Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(Row::new(["AGE", "TYPE", "REASON", "MESSAGE"]).style(head))
+        .block(
+            Block::bordered()
+                .border_style(dim)
+                .title(format!(" Events ({}) ", x.events.len())),
+        ),
         events,
     );
 
-    let [labels, annotations] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
+    let [labels, annotations] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(meta);
     frame.render_widget(map_table("Labels", &d.meta.labels, 3), labels);
-    frame.render_widget(map_table("Annotations", &d.meta.annotations, 3), annotations);
+    frame.render_widget(
+        map_table("Annotations", &d.meta.annotations, 3),
+        annotations,
+    );
 }
 
 /// One padded, colored "pill". Same text always gets the same color.
@@ -986,7 +1307,10 @@ fn pill(key: &str, value: &str) -> Span<'static> {
     let mut h = DefaultHasher::new(); // fixed keys: stable across runs
     key.hash(&mut h);
     let color = PALETTE[(h.finish() % PALETTE.len() as u64) as usize];
-    Span::styled(format!(" {key}={value} "), Style::new().bg(color).fg(Color::Black))
+    Span::styled(
+        format!(" {key}={value} "),
+        Style::new().bg(color).fg(Color::Black),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
@@ -1018,13 +1342,18 @@ struct ListView {
 
 impl ListView {
     fn sorted(sort: state::Sort) -> Self {
-        Self { table: TableState::default().with_selected(Some(0)), query: String::new(), sort_col: sort.column, ascending: sort.ascending }
+        Self {
+            table: TableState::default().with_selected(Some(0)),
+            query: String::new(),
+            sort_col: sort.column,
+            ascending: sort.ascending,
+        }
     }
 }
 
 /// The pod list of one namespace: its own informer, torn down when you go back.
 struct PodLevel {
-    scope: Option<String>, // namespace, or None for all namespaces
+    scope: Option<String>,     // namespace, or None for all namespaces
     filter: Option<PodFilter>, // set when opened from a node or a workload
     client: Client,
     api: Api<Pod>,
@@ -1034,7 +1363,7 @@ struct PodLevel {
     metrics: Arc<Mutex<MetricsState>>, // written by `metrics_task`, read every frame
     metrics_task: tokio::task::JoinHandle<()>,
     history: Arc<Mutex<History>>, // written by `metrics_task`, read by the container pane
-    events: Store<KubeEvent>, // pod events of the namespace, for the details view
+    events: Store<KubeEvent>,     // pod events of the namespace, for the details view
     events_task: tokio::task::JoinHandle<()>,
 }
 
@@ -1084,34 +1413,50 @@ fn open_pods(
             config = config.labels(labels);
         }
     }
-    let stream = reflector(writer, watcher(api.clone(), config)).default_backoff().applied_objects();
+    let stream = reflector(writer, watcher(api.clone(), config))
+        .default_backoff()
+        .applied_objects();
     let task = rt.spawn(stream.for_each(|_| async {}));
     // Second informer: only events about pods (server-side field selector).
     let (events, event_writer) = reflector::store();
     let event_stream = reflector(
         event_writer,
-        watcher(events_api, watcher::Config::default().fields("involvedObject.kind=Pod")),
+        watcher(
+            events_api,
+            watcher::Config::default().fields("involvedObject.kind=Pod"),
+        ),
     )
     .default_backoff()
     .applied_objects();
     let events_task = rt.spawn(event_stream.for_each(|_| async {}));
     let loading = activity.start(match &filter {
         Some(f) => format!("loading pods of {}", f.crumbs.join("/")),
-        None => format!("loading pods in {}", scope.as_deref().unwrap_or("all namespaces")),
+        None => format!(
+            "loading pods in {}",
+            scope.as_deref().unwrap_or("all namespaces")
+        ),
     });
     {
         let (store, tx) = (store.clone(), tx.clone());
         rt.spawn(async move {
             // Ok when the first list arrived, Err when the level was closed first. Either way, stop the spinner.
             let _ = store.wait_until_ready().await;
-            let _ = tx.send(Done { id: loading, message: None });
+            let _ = tx.send(Done {
+                id: loading,
+                message: None,
+            });
         });
     }
     // metrics-server only samples every ~15-60s, so poll slowly. Errors mean "not available".
     let metrics = Arc::new(Mutex::new(MetricsState::default()));
     let history: Arc<Mutex<History>> = Arc::default();
     let metrics_task = {
-        let (client, ns, metrics, history) = (client.clone(), scope.clone(), metrics.clone(), history.clone());
+        let (client, ns, metrics, history) = (
+            client.clone(),
+            scope.clone(),
+            metrics.clone(),
+            history.clone(),
+        );
         rt.spawn(async move {
             loop {
                 let result = fetch_metrics(&client, ns.as_deref()).await;
@@ -1127,7 +1472,10 @@ fn open_pods(
                         }
                     }
                     // Forget pods and containers that are gone, or the map only ever grows.
-                    h.retain(|(pod, name), _| pods.get(pod).is_some_and(|cs| cs.iter().any(|(n, _)| n == name)));
+                    h.retain(|(pod, name), _| {
+                        pods.get(pod)
+                            .is_some_and(|cs| cs.iter().any(|(n, _)| n == name))
+                    });
                 }
                 {
                     // The lock is released at the end of this block, before the sleep.
@@ -1137,7 +1485,11 @@ fn open_pods(
                         .unwrap_or_default()
                         .into_iter()
                         .map(|(pod, cs)| {
-                            let total = cs.iter().fold(Usage { cpu: 0, mem: 0 }, |a, (_, u)| Usage { cpu: a.cpu + u.cpu, mem: a.mem + u.mem });
+                            let total =
+                                cs.iter().fold(Usage { cpu: 0, mem: 0 }, |a, (_, u)| Usage {
+                                    cpu: a.cpu + u.cpu,
+                                    mem: a.mem + u.mem,
+                                });
                             (pod, total)
                         })
                         .collect();
@@ -1146,7 +1498,20 @@ fn open_pods(
             }
         })
     };
-    PodLevel { scope, filter, client: client.clone(), api, store, task, loading, metrics, metrics_task, history, events, events_task }
+    PodLevel {
+        scope,
+        filter,
+        client: client.clone(),
+        api,
+        store,
+        task,
+        loading,
+        metrics,
+        metrics_task,
+        history,
+        events,
+        events_task,
+    }
 }
 
 #[tokio::main]
@@ -1164,7 +1529,10 @@ async fn main() -> anyhow::Result<()> {
         if types.is_empty() {
             types = resources::builtin(); // discovery failed; `po`, `ns` and friends still work
         }
-        let info = resources::matches(&types, &query, &SkimMatcherV2::default()).into_iter().next().ok_or_else(|| anyhow::anyhow!("unknown resource type: {query}"))?;
+        let info = resources::matches(&types, &query, &SkimMatcherV2::default())
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("unknown resource type: {query}"))?;
         state.open = match info.target() {
             resources::Target::Dashboard => state::Level::Dashboard,
             resources::Target::Namespaces => state::Level::Namespaces,
@@ -1176,20 +1544,36 @@ async fn main() -> anyhow::Result<()> {
     // run() enters raw mode + alternate screen (fullscreen) and restores on exit/panic.
     // The TUI loop is blocking, so it runs on a blocking thread; there it may call rt.block_on.
     tokio::task::spawn_blocking(move || {
-        ratatui::run(|terminal| loop {
-            let notice_now = std::mem::take(&mut notice);
-            let exit = run_app(terminal, &session.store, &session.api, &session.client, &rt, &session.info, state.clone(), state_path.as_deref(), notice_now, &session.resource_types)?;
-            match exit {
-                Exit::Quit => return Ok::<(), std::io::Error>(()),
-                Exit::Switch { context, state: last } => {
-                    state = last;
-                    match rt.block_on(connect(Some(&context))) {
-                        Ok(next) => {
-                            session = next; // dropping the old session stops its background tasks
-                            state.namespace = None; // that namespace may not exist over there
-                            notice = format!("switched to context {context}");
+        ratatui::run(|terminal| {
+            loop {
+                let notice_now = std::mem::take(&mut notice);
+                let exit = run_app(
+                    terminal,
+                    &session.store,
+                    &session.api,
+                    &session.client,
+                    &rt,
+                    &session.info,
+                    state.clone(),
+                    state_path.as_deref(),
+                    notice_now,
+                    &session.resource_types,
+                )?;
+                match exit {
+                    Exit::Quit => return Ok::<(), std::io::Error>(()),
+                    Exit::Switch {
+                        context,
+                        state: last,
+                    } => {
+                        state = last;
+                        match rt.block_on(connect(Some(&context))) {
+                            Ok(next) => {
+                                session = next; // dropping the old session stops its background tasks
+                                state.namespace = None; // that namespace may not exist over there
+                                notice = format!("switched to context {context}");
+                            }
+                            Err(e) => notice = format!("cannot switch to {context}: {e:#}"),
                         }
-                        Err(e) => notice = format!("cannot switch to {context}: {e:#}"),
                     }
                 }
             }
@@ -1200,18 +1584,25 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// `[-n|--namespace NAME] [RESOURCE]`
-fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(Option<String>, Option<String>)> {
+fn parse_args(
+    args: impl Iterator<Item = String>,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     let (mut namespace, mut resource) = (None, None);
     let mut args = args;
     while let Some(a) = args.next() {
         if a == "-n" || a == "--namespace" {
-            namespace = Some(args.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value"))?);
+            namespace = Some(
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("{a} needs a value"))?,
+            );
         } else if let Some(v) = a.strip_prefix("--namespace=") {
             namespace = Some(v.to_string());
         } else if a.starts_with('-') {
             anyhow::bail!("unknown option: {a}\nusage: kolombo [-n NAMESPACE] [RESOURCE]");
         } else if resource.replace(a).is_some() {
-            anyhow::bail!("only one resource argument is allowed\nusage: kolombo [-n NAMESPACE] [RESOURCE]");
+            anyhow::bail!(
+                "only one resource argument is allowed\nusage: kolombo [-n NAMESPACE] [RESOURCE]"
+            );
         }
     }
     Ok((namespace, resource))
@@ -1220,7 +1611,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> anyhow::Result<(Option<Stri
 /// How `run_app` ended.
 enum Exit {
     Quit,
-    Switch { context: String, state: state::State }, // Ctrl+x: reconnect to another kubeconfig context
+    Switch {
+        context: String,
+        state: state::State,
+    }, // Ctrl+x: reconnect to another kubeconfig context
 }
 
 /// Everything tied to one cluster connection. Dropping it stops its background tasks.
@@ -1246,12 +1640,21 @@ async fn connect(context: Option<&str>) -> anyhow::Result<Session> {
     let (client, name) = match context {
         None => (Client::try_default().await?, current_context()),
         Some(c) => {
-            let options = kube::config::KubeConfigOptions { context: Some(c.to_string()), ..Default::default() };
-            (Client::try_from(kube::Config::from_kubeconfig(&options).await?)?, c.to_string())
+            let options = kube::config::KubeConfigOptions {
+                context: Some(c.to_string()),
+                ..Default::default()
+            };
+            (
+                Client::try_from(kube::Config::from_kubeconfig(&options).await?)?,
+                c.to_string(),
+            )
         }
     };
     let api: Api<Namespace> = Api::all(client.clone());
-    let info = HeaderInfo { context: name, version: Arc::new(OnceLock::new()) };
+    let info = HeaderInfo {
+        context: name,
+        version: Arc::new(OnceLock::new()),
+    };
     let mut tasks = Vec::new();
     {
         // Ask for the server version in the background so an unreachable cluster can't block startup.
@@ -1279,12 +1682,21 @@ async fn connect(context: Option<&str>) -> anyhow::Result<Session> {
             }
         }));
     }
-    Ok(Session { client, api, store, info, resource_types, tasks })
+    Ok(Session {
+        client,
+        api,
+        store,
+        info,
+        resource_types,
+        tasks,
+    })
 }
 
 /// Context names from the kubeconfig, sorted.
 fn context_names() -> Vec<String> {
-    let mut names: Vec<String> = kube::config::Kubeconfig::read().map(|c| c.contexts.into_iter().map(|c| c.name).collect()).unwrap_or_default();
+    let mut names: Vec<String> = kube::config::Kubeconfig::read()
+        .map(|c| c.contexts.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default();
     names.sort();
     names
 }
@@ -1292,13 +1704,33 @@ fn context_names() -> Vec<String> {
 /// Best fuzzy match first; everything (in order) for an empty query.
 fn context_matches(names: &[String], query: &str) -> Vec<String> {
     let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, &String)> = names.iter().filter_map(|n| Some((if query.is_empty() { 0 } else { matcher.fuzzy_match(n, query)? }, n))).collect();
+    let mut scored: Vec<(i64, &String)> = names
+        .iter()
+        .filter_map(|n| {
+            Some((
+                if query.is_empty() {
+                    0
+                } else {
+                    matcher.fuzzy_match(n, query)?
+                },
+                n,
+            ))
+        })
+        .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     scored.into_iter().map(|(_, n)| n.clone()).collect()
 }
 
-async fn patch_message(api: Api<DynamicObject>, name: String, patch: k8s_openapi::serde_json::Value, done: String) -> String {
-    match api.patch(&name, &PatchParams::default(), &Patch::Merge(patch)).await {
+async fn patch_message(
+    api: Api<DynamicObject>,
+    name: String,
+    patch: k8s_openapi::serde_json::Value,
+    done: String,
+) -> String {
+    match api
+        .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+        .await
+    {
         Ok(_) => done,
         Err(e) => format!("{name}: {e}"),
     }
@@ -1306,17 +1738,54 @@ async fn patch_message(api: Api<DynamicObject>, name: String, patch: k8s_openapi
 
 /// A popup that grabs all keys until closed.
 enum Modal {
-    Delete { name: String, kind: String, yes: bool }, // `yes` = which button is focused
-    New(String),                                            // name typed so far
-    Help(Hints),                                            // key list of the current pane
-    Containers { pod: String, names: Vec<String>, sel: usize }, // log container picker; row 0 = all
-    Namespaces { query: String, sel: usize, current: Option<String> }, // namespace picker; row 0 = all namespaces
-    Drain { node: String, opts: drain::DrainOpts, focus: usize, yes: bool }, // focus 0..=3 = checkboxes, 4 = buttons
-    Command { query: String, sel: usize },                              // `:` resource picker
-    Scale { key: String, kind: String, input: String },                 // replica count typed so far
-    Restart { key: String, kind: String, yes: bool },
-    Contexts { query: String, sel: usize, names: Vec<String>, current: String }, // Ctrl+x
-    Images { title: String, rows: Vec<(String, usize)>, sel: usize }, // `i`: image, pods running it
+    Delete {
+        name: String,
+        kind: String,
+        yes: bool,
+    }, // `yes` = which button is focused
+    New(String), // name typed so far
+    Help(Hints), // key list of the current pane
+    Containers {
+        pod: String,
+        names: Vec<String>,
+        sel: usize,
+    }, // log container picker; row 0 = all
+    Namespaces {
+        query: String,
+        sel: usize,
+        current: Option<String>,
+    }, // namespace picker; row 0 = all namespaces
+    Drain {
+        node: String,
+        opts: drain::DrainOpts,
+        focus: usize,
+        yes: bool,
+    }, // focus 0..=3 = checkboxes, 4 = buttons
+    Command {
+        query: String,
+        sel: usize,
+    }, // `:` resource picker
+    Scale {
+        key: String,
+        kind: String,
+        input: String,
+    }, // replica count typed so far
+    Restart {
+        key: String,
+        kind: String,
+        yes: bool,
+    },
+    Contexts {
+        query: String,
+        sel: usize,
+        names: Vec<String>,
+        current: String,
+    }, // Ctrl+x
+    Images {
+        title: String,
+        rows: Vec<(String, usize)>,
+        sel: usize,
+    }, // `i`: image, pods running it
 }
 
 /// A list of any resource type; the spinner stops when its first full list has arrived.
@@ -1334,54 +1803,89 @@ fn open_generic(
     let (store, tx) = (view.store().clone(), tx.clone());
     rt.spawn(async move {
         let _ = store.wait_until_ready().await;
-        let _ = tx.send(Done { id: loading, message: None });
+        let _ = tx.send(Done {
+            id: loading,
+            message: None,
+        });
     });
     view
 }
 
 fn container_names(pod: &Pod) -> Vec<String> {
-    pod.spec.iter().flat_map(|s| s.containers.iter().map(|c| c.name.clone())).collect()
+    pod.spec
+        .iter()
+        .flat_map(|s| s.containers.iter().map(|c| c.name.clone()))
+        .collect()
 }
 
 /// Log view of one pod: just `only`, or every container when None.
-fn open_logs(pods: &Option<PodLevel>, rt: &tokio::runtime::Handle, name: String, only: Option<String>) -> Option<log_view::LogView> {
+fn open_logs(
+    pods: &Option<PodLevel>,
+    rt: &tokio::runtime::Handle,
+    name: String,
+    only: Option<String>,
+) -> Option<log_view::LogView> {
     let p = pods.as_ref()?;
     let containers = match only {
         Some(c) => vec![c],
         None => container_names(&*find_in(&p.store, &name)?),
     };
-    (!containers.is_empty()).then(|| log_view::LogView::new(p.api_for(&name), rt.clone(), name, containers))
+    (!containers.is_empty())
+        .then(|| log_view::LogView::new(p.api_for(&name), rt.clone(), name, containers))
 }
 
-fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_matches: &[resources::ResourceInfo]) {
+fn render_modal(
+    frame: &mut Frame,
+    modal: &Modal,
+    ns_matches: &[String],
+    res_matches: &[resources::ResourceInfo],
+) {
     match modal {
         Modal::Delete { name, kind, yes } => {
-            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(5));
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(50), Constraint::Length(5));
             frame.render_widget(Clear, area);
             let button = |label: &str, focused: bool| {
-                let style = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                let style = if focused {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
                 Span::styled(format!(" {label} "), style)
             };
             let text = vec![
                 Line::from(format!("Delete {kind} \"{name}\"?")),
                 Line::raw(""),
-                Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]),
+                Line::from(vec![
+                    button("Yes", *yes),
+                    Span::raw("   "),
+                    button("No", !*yes),
+                ]),
             ];
             frame.render_widget(
-                Paragraph::new(text)
-                    .centered()
-                    .block(Block::bordered().border_style(Style::new().fg(Color::Red)).title(" Delete (y/n, Enter) ")),
+                Paragraph::new(text).centered().block(
+                    Block::bordered()
+                        .border_style(Style::new().fg(Color::Red))
+                        .title(" Delete (y/n, Enter) "),
+                ),
                 area,
             );
         }
         Modal::Help(hints) => {
-            let area = frame.area().centered(Constraint::Length(40), Constraint::Length(hints.len() as u16 + 2));
+            let area = frame.area().centered(
+                Constraint::Length(40),
+                Constraint::Length(hints.len() as u16 + 2),
+            );
             frame.render_widget(Clear, area);
             let lines: Vec<Line> = hints
                 .iter()
                 .map(|(k, d)| {
                     Line::from(vec![
-                        Span::styled(format!(" {k:<7}"), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!(" {k:<7}"),
+                            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(*d, Style::new().fg(Color::Gray)),
                     ])
                 })
@@ -1393,26 +1897,42 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
         }
         Modal::Images { title, rows, sel } => {
             let height = (rows.len() as u16 + 2).clamp(3, frame.area().height.saturating_sub(4));
-            let area = frame.area().centered(Constraint::Percentage(80), Constraint::Length(height));
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(80), Constraint::Length(height));
             frame.render_widget(Clear, area);
             let items: Vec<ListItem> = rows
                 .iter()
-                .map(|(image, n)| ListItem::new(Line::from(vec![Span::styled(format!("{n:>4}  "), Style::new().fg(Color::Yellow)), Span::raw(image.clone())])))
+                .map(|(image, n)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{n:>4}  "), Style::new().fg(Color::Yellow)),
+                        Span::raw(image.clone()),
+                    ]))
+                })
                 .collect();
             let total: usize = rows.iter().map(|r| r.1).sum();
             let mut state = ListState::default().with_selected(Some(*sel));
             frame.render_stateful_widget(
                 List::new(items)
                     .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-                    .block(Block::bordered().title(format!(" {title}: {} images, {total} pod refs (Esc) ", rows.len()))),
+                    .block(Block::bordered().title(format!(
+                        " {title}: {} images, {total} pod refs (Esc) ",
+                        rows.len()
+                    ))),
                 area,
                 &mut state,
             );
         }
         Modal::Containers { names, sel, .. } => {
-            let area = frame.area().centered(Constraint::Length(44), Constraint::Length(names.len() as u16 + 3));
+            let area = frame.area().centered(
+                Constraint::Length(44),
+                Constraint::Length(names.len() as u16 + 3),
+            );
             frame.render_widget(Clear, area);
-            let rows: Vec<Line> = std::iter::once("all containers".to_string()).chain(names.iter().cloned()).map(Line::from).collect();
+            let rows: Vec<Line> = std::iter::once("all containers".to_string())
+                .chain(names.iter().cloned())
+                .map(Line::from)
+                .collect();
             let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
             let mut state = ListState::default().with_selected(Some(*sel));
             frame.render_stateful_widget(
@@ -1423,32 +1943,75 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
                 &mut state,
             );
         }
-        Modal::Drain { node, opts, focus, yes } => {
-            let area = frame.area().centered(Constraint::Length(62), Constraint::Length(9));
+        Modal::Drain {
+            node,
+            opts,
+            focus,
+            yes,
+        } => {
+            let area = frame
+                .area()
+                .centered(Constraint::Length(62), Constraint::Length(9));
             frame.render_widget(Clear, area);
             let boxes = [
-                (opts.ignore_daemonsets, "Ignore DaemonSets", "their pods are left running"),
-                (opts.force, "Force", "also pods no controller would recreate"),
-                (opts.disable_eviction, "Disable eviction", "delete directly, ignore disruption budgets"),
-                (opts.delete_emptydir, "Delete emptyDir data", "pods using emptyDir lose that data"),
+                (
+                    opts.ignore_daemonsets,
+                    "Ignore DaemonSets",
+                    "their pods are left running",
+                ),
+                (
+                    opts.force,
+                    "Force",
+                    "also pods no controller would recreate",
+                ),
+                (
+                    opts.disable_eviction,
+                    "Disable eviction",
+                    "delete directly, ignore disruption budgets",
+                ),
+                (
+                    opts.delete_emptydir,
+                    "Delete emptyDir data",
+                    "pods using emptyDir lose that data",
+                ),
             ];
             let mut lines: Vec<Line> = boxes
                 .iter()
                 .enumerate()
                 .map(|(i, (on, label, hint))| {
-                    let row = if *focus == i { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                    let row = if *focus == i {
+                        Style::new().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::new()
+                    };
                     Line::from(vec![
-                        Span::styled(format!(" [{}] {label:<21}", if *on { "x" } else { " " }), row),
+                        Span::styled(
+                            format!(" [{}] {label:<21}", if *on { "x" } else { " " }),
+                            row,
+                        ),
                         Span::styled(format!(" {hint}"), Style::new().fg(Color::DarkGray)),
                     ])
                 })
                 .collect();
             lines.push(Line::raw(""));
             let button = |label: &str, active: bool| {
-                let style = if active && *focus == 4 { Style::new().add_modifier(Modifier::REVERSED) } else if active { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+                let style = if active && *focus == 4 {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else if active {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
                 Span::styled(format!(" {label} "), style)
             };
-            lines.push(Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]).centered());
+            lines.push(
+                Line::from(vec![
+                    button("Yes", *yes),
+                    Span::raw("   "),
+                    button("No", !*yes),
+                ])
+                .centered(),
+            );
             frame.render_widget(
                 Paragraph::new(lines).block(
                     Block::bordered()
@@ -1462,17 +2025,30 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
             // Same box as the search popup, with the matching resource types listed under it.
             let rows = res_matches.len().min(8) as u16;
             let list_h = if rows > 0 { rows + 2 } else { 0 };
-            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3 + list_h));
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(50), Constraint::Length(3 + list_h));
             frame.render_widget(Clear, area);
-            let [input, list] = Layout::vertical([Constraint::Length(3), Constraint::Length(list_h)]).areas(area);
-            frame.render_widget(Paragraph::new(query.as_str()).block(Block::bordered().title(" Resource ")), input);
+            let [input, list] =
+                Layout::vertical([Constraint::Length(3), Constraint::Length(list_h)]).areas(area);
+            frame.render_widget(
+                Paragraph::new(query.as_str()).block(Block::bordered().title(" Resource ")),
+                input,
+            );
             let dim = Style::new().fg(Color::DarkGray);
             let items: Vec<ListItem> = res_matches
                 .iter()
                 .map(|r| {
                     let name = Style::new();
-                    let group = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
-                    let mut spans = vec![Span::styled(r.name.clone(), name.add_modifier(Modifier::BOLD))];
+                    let group = if r.group.is_empty() {
+                        r.version.clone()
+                    } else {
+                        format!("{}/{}", r.group, r.version)
+                    };
+                    let mut spans = vec![Span::styled(
+                        r.name.clone(),
+                        name.add_modifier(Modifier::BOLD),
+                    )];
                     if !r.short_names.is_empty() {
                         spans.push(Span::styled(format!(" ({})", r.aliases()), dim));
                     }
@@ -1480,81 +2056,166 @@ fn render_modal(frame: &mut Frame, modal: &Modal, ns_matches: &[String], res_mat
                     ListItem::new(Line::from(spans))
                 })
                 .collect();
-            let mut state = ListState::default().with_selected(Some((*sel).min(res_matches.len().saturating_sub(1))));
+            let mut state = ListState::default()
+                .with_selected(Some((*sel).min(res_matches.len().saturating_sub(1))));
             if list_h > 0 {
                 frame.render_stateful_widget(
-                    List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)).block(Block::bordered().border_style(dim)),
+                    List::new(items)
+                        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                        .block(Block::bordered().border_style(dim)),
                     list,
                     &mut state,
                 );
             }
             frame.set_cursor_position((input.x + 1 + query.chars().count() as u16, input.y + 1));
         }
-        Modal::Namespaces { query, sel, current } => {
-            let height = (ns_matches.len() as u16 + 4).min(frame.area().height * 7 / 10).max(5);
-            let area = frame.area().centered(Constraint::Length(50), Constraint::Length(height));
+        Modal::Namespaces {
+            query,
+            sel,
+            current,
+        } => {
+            let height = (ns_matches.len() as u16 + 4)
+                .min(frame.area().height * 7 / 10)
+                .max(5);
+            let area = frame
+                .area()
+                .centered(Constraint::Length(50), Constraint::Length(height));
             frame.render_widget(Clear, area);
             let block = Block::bordered().title(" Namespace (Enter, Esc) ");
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled("> ", Style::new().fg(Color::Yellow)), Span::raw(query.as_str())])), input);
+            let [input, list] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("> ", Style::new().fg(Color::Yellow)),
+                    Span::raw(query.as_str()),
+                ])),
+                input,
+            );
             let mark = |on: bool| if on { " ●" } else { "" };
             let mut items = vec![ListItem::new(Line::from(vec![
-                Span::styled("all namespaces", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "all namespaces",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(mark(current.is_none())),
             ]))];
-            items.extend(ns_matches.iter().map(|n| ListItem::new(format!("{n}{}", mark(current.as_deref() == Some(n.as_str()))))));
+            items.extend(ns_matches.iter().map(|n| {
+                ListItem::new(format!(
+                    "{n}{}",
+                    mark(current.as_deref() == Some(n.as_str()))
+                ))
+            }));
             let mut state = ListState::default().with_selected(Some((*sel).min(ns_matches.len())));
-            frame.render_stateful_widget(List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)), list, &mut state);
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+                list,
+                &mut state,
+            );
             frame.set_cursor_position((input.x + 2 + query.chars().count() as u16, input.y));
         }
         Modal::Scale { key, kind, input } => {
-            let area = frame.area().centered(Constraint::Length(46), Constraint::Length(5));
+            let area = frame
+                .area()
+                .centered(Constraint::Length(46), Constraint::Length(5));
             frame.render_widget(Clear, area);
             let lines = vec![
                 Line::from(format!("Scale {kind} \"{key}\"")),
                 Line::raw(""),
-                Line::from(vec![Span::styled("replicas: ", Style::new().fg(Color::DarkGray)), Span::raw(input.as_str())]),
+                Line::from(vec![
+                    Span::styled("replicas: ", Style::new().fg(Color::DarkGray)),
+                    Span::raw(input.as_str()),
+                ]),
             ];
-            frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Scale (↑↓ ±1, Enter, Esc) ")), area);
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(" Scale (↑↓ ±1, Enter, Esc) ")),
+                area,
+            );
             frame.set_cursor_position((area.x + 1 + 10 + input.chars().count() as u16, area.y + 3));
         }
         Modal::Restart { key, kind, yes } => {
-            let area = frame.area().centered(Constraint::Percentage(55), Constraint::Length(6));
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(55), Constraint::Length(6));
             frame.render_widget(Clear, area);
             let button = |label: &str, focused: bool| {
-                let style = if focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+                let style = if focused {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
                 Span::styled(format!(" {label} "), style)
             };
             let text = vec![
                 Line::from(format!("Restart {kind} \"{key}\"?")),
-                Line::from(Span::styled("its pods are replaced, a few at a time", Style::new().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    "its pods are replaced, a few at a time",
+                    Style::new().fg(Color::DarkGray),
+                )),
                 Line::raw(""),
-                Line::from(vec![button("Yes", *yes), Span::raw("   "), button("No", !*yes)]),
+                Line::from(vec![
+                    button("Yes", *yes),
+                    Span::raw("   "),
+                    button("No", !*yes),
+                ]),
             ];
-            frame.render_widget(Paragraph::new(text).centered().block(Block::bordered().border_style(Style::new().fg(Color::Yellow)).title(" Restart (y/n, Enter) ")), area);
+            frame.render_widget(
+                Paragraph::new(text).centered().block(
+                    Block::bordered()
+                        .border_style(Style::new().fg(Color::Yellow))
+                        .title(" Restart (y/n, Enter) "),
+                ),
+                area,
+            );
         }
-        Modal::Contexts { query, sel, names, current } => {
+        Modal::Contexts {
+            query,
+            sel,
+            names,
+            current,
+        } => {
             let found = context_matches(names, query);
-            let height = (found.len() as u16 + 4).min(frame.area().height * 7 / 10).max(5);
-            let area = frame.area().centered(Constraint::Length(60), Constraint::Length(height));
+            let height = (found.len() as u16 + 4)
+                .min(frame.area().height * 7 / 10)
+                .max(5);
+            let area = frame
+                .area()
+                .centered(Constraint::Length(60), Constraint::Length(height));
             frame.render_widget(Clear, area);
             let block = Block::bordered().title(" Context (Enter, Esc) ");
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled("> ", Style::new().fg(Color::Yellow)), Span::raw(query.as_str())])), input);
-            let items: Vec<ListItem> = found.iter().map(|n| ListItem::new(format!("{n}{}", if n == current { " ●" } else { "" }))).collect();
-            let mut state = ListState::default().with_selected(Some((*sel).min(found.len().saturating_sub(1))));
-            frame.render_stateful_widget(List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)), list, &mut state);
+            let [input, list] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("> ", Style::new().fg(Color::Yellow)),
+                    Span::raw(query.as_str()),
+                ])),
+                input,
+            );
+            let items: Vec<ListItem> = found
+                .iter()
+                .map(|n| ListItem::new(format!("{n}{}", if n == current { " ●" } else { "" })))
+                .collect();
+            let mut state =
+                ListState::default().with_selected(Some((*sel).min(found.len().saturating_sub(1))));
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED)),
+                list,
+                &mut state,
+            );
             frame.set_cursor_position((input.x + 2 + query.chars().count() as u16, input.y));
         }
         Modal::New(input) => {
-            let area = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
+            let area = frame
+                .area()
+                .centered(Constraint::Percentage(50), Constraint::Length(3));
             frame.render_widget(Clear, area);
             frame.render_widget(
-                Paragraph::new(input.as_str()).block(Block::bordered().title(" New namespace (Enter create, Esc cancel) ")),
+                Paragraph::new(input.as_str())
+                    .block(Block::bordered().title(" New namespace (Enter create, Esc cancel) ")),
                 area,
             );
             frame.set_cursor_position((area.x + 1 + input.chars().count() as u16, area.y + 1));
@@ -1612,7 +2273,11 @@ impl Activity {
     fn status(&self, tick: usize) -> Option<String> {
         const BAR: [&str; 6] = ["[=   ]", "[ =  ]", "[  = ]", "[   =]", "[  = ]", "[ =  ]"];
         let (_, label) = self.items.last()?;
-        let more = if self.items.len() > 1 { format!(" +{}", self.items.len() - 1) } else { String::new() };
+        let more = if self.items.len() > 1 {
+            format!(" +{}", self.items.len() - 1)
+        } else {
+            String::new()
+        };
         Some(format!("{} {label}{more}", BAR[tick % BAR.len()]))
     }
 }
@@ -1629,7 +2294,10 @@ fn spawn_op(
     let tx = tx.clone();
     rt.spawn(async move {
         let message = fut.await;
-        let _ = tx.send(Done { id, message: Some(message) });
+        let _ = tx.send(Done {
+            id,
+            message: Some(message),
+        });
     });
 }
 
@@ -1644,7 +2312,10 @@ fn copy(clipboard: &mut Option<arboard::Clipboard>, text: &str) -> anyhow::Resul
 
 /// Open the object as YAML in $EDITOR and parse the result.
 /// Returns the edited object, or None when nothing changed.
-fn edit_obj<K: Kind>(terminal: &mut DefaultTerminal, obj: &K) -> anyhow::Result<Option<(String, K)>> {
+fn edit_obj<K: Kind>(
+    terminal: &mut DefaultTerminal,
+    obj: &K,
+) -> anyhow::Result<Option<(String, K)>> {
     let name = obj.name_any();
     let mut copy = obj.clone();
     copy.meta_mut().managed_fields = None; // noise, kubectl hides it too
@@ -1682,12 +2353,16 @@ fn edit_flow<K: Kind>(
     name: &str,
     message: &mut String,
 ) {
-    let Some(obj) = find_in(store, name) else { return };
+    let Some(obj) = find_in(store, name) else {
+        return;
+    };
     match edit_obj(terminal, &*obj) {
         Ok(Some((name, edited))) => {
             let api = api.clone();
             let label = format!("updating {name}");
-            spawn_op(rt, tx, activity, label, async move { replace_obj(&api, &name, &edited).await });
+            spawn_op(rt, tx, activity, label, async move {
+                replace_obj(&api, &name, &edited).await
+            });
         }
         Ok(None) => *message = "no changes".into(),
         Err(e) => *message = format!("edit failed: {e:#}"),
@@ -1700,10 +2375,10 @@ fn find_in<K: Kind>(store: &Store<K>, name: &str) -> Option<Arc<K>> {
         Some((ns, n)) => (Some(ns), n),
         None => (None, name),
     };
-    store
-        .state()
-        .into_iter()
-        .find(|o| o.meta().name.as_deref() == Some(name) && (ns.is_none() || o.meta().namespace.as_deref() == ns))
+    store.state().into_iter().find(|o| {
+        o.meta().name.as_deref() == Some(name)
+            && (ns.is_none() || o.meta().namespace.as_deref() == ns)
+    })
 }
 
 /// What a list shows: filtered by the query, or sorted by the chosen column when there is none.
@@ -1770,7 +2445,10 @@ fn count_text(n: Option<u64>) -> String {
 /// Gauge plus numbers: `⣿⣿⣀⣀⣀⣀ 340m/3920m`.
 fn gauge(used: Option<u64>, alloc: Option<u64>, text: fn(Option<u64>) -> String) -> Line<'static> {
     let mut line = usage_bar(used, None, alloc);
-    line.spans.push(Span::styled(format!(" {}/{}", text(used), text(alloc)), Style::new().fg(Color::Gray)));
+    line.spans.push(Span::styled(
+        format!(" {}/{}", text(used), text(alloc)),
+        Style::new().fg(Color::Gray),
+    ));
     line
 }
 
@@ -1797,12 +2475,20 @@ fn render_list(
         }
         Cell::from(Line::from(spans))
     };
-    let status_cell = |n: &Item| Cell::from(n.status.clone()).style(Style::new().fg(status_color(&n.status)));
+    let status_cell =
+        |n: &Item| Cell::from(n.status.clone()).style(Style::new().fg(status_color(&n.status)));
 
     // (title, which sort column it is, width)
-    let workload = if let ListKind::Pane(w) = kind { Some(w) } else { None };
+    let workload = if let ListKind::Pane(w) = kind {
+        Some(w)
+    } else {
+        None
+    };
     let columns: Vec<(&str, Option<Column>, Constraint)> = if let Some(w) = workload {
-        let mut c = vec![("NAME", Some(Column::Name), Constraint::Fill(2)), ("STATUS", Some(Column::Status), Constraint::Length(14))];
+        let mut c = vec![
+            ("NAME", Some(Column::Name), Constraint::Fill(2)),
+            ("STATUS", Some(Column::Status), Constraint::Length(14)),
+        ];
         c.extend(panes::columns(w).into_iter().map(|(t, w)| (t, None, w)));
         c.push(("AGE", Some(Column::Age), Constraint::Length(5)));
         c
@@ -1851,49 +2537,72 @@ fn render_list(
         }
         Row::new(cells)
     }
-    let columns: Vec<_> = columns.into_iter().enumerate().filter(|(i, _)| Some(*i) != hide_status).map(|(_, c)| c).collect();
+    let columns: Vec<_> = columns
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != hide_status)
+        .map(|(_, c)| c)
+        .collect();
     let rows = visible.iter().map(|n| {
         let age = Cell::from(format_age(now - n.created));
         if let (Some(extra), true) = (&n.extra, workload.is_some()) {
             let mut cells = vec![Cell::from(n.name.clone()), status_cell(n)];
-            cells.extend(extra.iter().map(|(t, c)| Cell::from(t.clone()).style(Style::new().fg(*c))));
+            cells.extend(
+                extra
+                    .iter()
+                    .map(|(t, c)| Cell::from(t.clone()).style(Style::new().fg(*c))),
+            );
             cells.push(age);
             return mk(cells, hide_status);
         }
         match (&n.pod, &n.node, metrics) {
             (_, Some(nc), Some(m)) => {
                 let u = m.usage.get(&n.name);
-                mk(vec![
-                    Cell::from(n.name.clone()),
-                    status_cell(n),
-                    Cell::from(nc.roles.clone()),
-                    Cell::from(gauge(u.map(|u| u.cpu), nc.cpu_alloc, cpu_text)),
-                    Cell::from(gauge(u.map(|u| u.mem), nc.mem_alloc, mem_text)),
-                    Cell::from(gauge(Some(nc.pods as u64), nc.pods_alloc, count_text)),
-                    Cell::from(nc.version.clone()),
-                    Cell::from(nc.ip.clone()),
-                    Cell::from(nc.os.clone()),
-                    age,
-                ], hide_status)
+                mk(
+                    vec![
+                        Cell::from(n.name.clone()),
+                        status_cell(n),
+                        Cell::from(nc.roles.clone()),
+                        Cell::from(gauge(u.map(|u| u.cpu), nc.cpu_alloc, cpu_text)),
+                        Cell::from(gauge(u.map(|u| u.mem), nc.mem_alloc, mem_text)),
+                        Cell::from(gauge(Some(nc.pods as u64), nc.pods_alloc, count_text)),
+                        Cell::from(nc.version.clone()),
+                        Cell::from(nc.ip.clone()),
+                        Cell::from(nc.os.clone()),
+                        age,
+                    ],
+                    hide_status,
+                )
             }
             (Some(p), _, Some(m)) => {
                 let u = m.usage.get(&n.name);
-                mk(vec![
-                    Cell::from(n.name.clone()),
-                    Cell::from(p.ready.clone()),
-                    status_cell(n),
-                    Cell::from(p.restarts.clone()),
-                    Cell::from(usage_bar(u.map(|u| u.cpu), p.cpu_req, p.cpu_lim)),
-                    Cell::from(cpu_text(p.cpu_req)),
-                    Cell::from(cpu_text(p.cpu_lim)),
-                    Cell::from(usage_bar(u.map(|u| u.mem), p.mem_req, p.mem_lim)),
-                    Cell::from(mem_text(p.mem_req)),
-                    Cell::from(mem_text(p.mem_lim)),
-                    Cell::from(p.image.clone()),
-                    age,
-                ], hide_status)
+                mk(
+                    vec![
+                        Cell::from(n.name.clone()),
+                        Cell::from(p.ready.clone()),
+                        status_cell(n),
+                        Cell::from(p.restarts.clone()),
+                        Cell::from(usage_bar(u.map(|u| u.cpu), p.cpu_req, p.cpu_lim)),
+                        Cell::from(cpu_text(p.cpu_req)),
+                        Cell::from(cpu_text(p.cpu_lim)),
+                        Cell::from(usage_bar(u.map(|u| u.mem), p.mem_req, p.mem_lim)),
+                        Cell::from(mem_text(p.mem_req)),
+                        Cell::from(mem_text(p.mem_lim)),
+                        Cell::from(p.image.clone()),
+                        age,
+                    ],
+                    hide_status,
+                )
             }
-            _ => mk(vec![Cell::from(n.name.clone()), status_cell(n), age, labels_cell(n)], hide_status),
+            _ => mk(
+                vec![
+                    Cell::from(n.name.clone()),
+                    status_cell(n),
+                    age,
+                    labels_cell(n),
+                ],
+                hide_status,
+            ),
         }
     });
     let header = Row::new(columns.iter().map(|(title, col, _)| match col {
@@ -1907,11 +2616,19 @@ fn render_list(
     // Pod lists say whether live usage is coming from metrics-server.
     let metrics_tag = match metrics.map(|m| m.available) {
         Some(Some(true)) => Some(Span::styled(" metrics ✓ ", Style::new().fg(Color::Green))),
-        Some(Some(false)) => Some(Span::styled(" metrics n/a ", Style::new().fg(Color::DarkGray))),
-        Some(None) => Some(Span::styled(" metrics … ", Style::new().fg(Color::DarkGray))),
+        Some(Some(false)) => Some(Span::styled(
+            " metrics n/a ",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Some(None) => Some(Span::styled(
+            " metrics … ",
+            Style::new().fg(Color::DarkGray),
+        )),
         None => None,
     };
-    let mut block = Block::bordered().title(format!(" {}/{} ", visible.len(), total)).title_bottom(format!(" {status} "));
+    let mut block = Block::bordered()
+        .title(format!(" {}/{} ", visible.len(), total))
+        .title_bottom(format!(" {status} "));
     if let Some(tag) = metrics_tag {
         block = block.title(Line::from(tag).right_aligned());
     }
@@ -1942,13 +2659,19 @@ fn run_app(
     let mut typing = false; // true while the search popup is open
     let mut viewing: Option<String> = None; // object shown in the details view (of the active level)
     let (tx, rx) = mpsc::channel::<Done>();
-    let mut activity = Activity { items: vec![(0, "loading namespaces".into())], next: 0 };
+    let mut activity = Activity {
+        items: vec![(0, "loading namespaces".into())],
+        next: 0,
+    };
     {
         // id 0: the informer's first full list has arrived
         let (store, tx) = (store.clone(), tx.clone());
         rt.spawn(async move {
             let _ = store.wait_until_ready().await;
-            let _ = tx.send(Done { id: 0, message: None });
+            let _ = tx.send(Done {
+                id: 0,
+                message: None,
+            });
         });
     }
     let started = Instant::now();
@@ -1962,7 +2685,10 @@ fn run_app(
     let mut helm: Option<helm::HelmView> = None; // Helm release list
     let mut tree: Option<tree_view::TreeView> = None; // resource tree over whatever list is below
     let mut parked: Vec<generic_view::GenericView> = Vec::new(); // the lists we came down from, nearest last
-    let pods_info = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
+    let pods_info = resources::builtin()
+        .into_iter()
+        .find(|r| r.name == "pods")
+        .unwrap_or_default();
     let mut yaml: Option<YamlView> = None; // read-only YAML pane, when open
     let mut clipboard: Option<arboard::Clipboard> = None; // created on first copy, kept alive
     let mut message = notice; // result of the last action, cleared on next key
@@ -1972,15 +2698,35 @@ fn run_app(
     let remembered = state.resource.clone();
     if state.open == state::Level::Dashboard {
         dashboard = Some(dashboard::Dashboard::open(rt, client));
-    } else if state.open == state::Level::Resource && !remembered.version.is_empty() && !remembered.kind.is_empty() {
+    } else if state.open == state::Level::Resource
+        && !remembered.version.is_empty()
+        && !remembered.kind.is_empty()
+    {
         match remembered.target() {
             resources::Target::Pods => {
-                pods = Some(open_pods(client, rt, &tx, &mut activity, state.namespace.clone(), None));
+                pods = Some(open_pods(
+                    client,
+                    rt,
+                    &tx,
+                    &mut activity,
+                    state.namespace.clone(),
+                    None,
+                ));
                 lists.push(ListView::sorted(state.sort.resource));
             }
-            resources::Target::Namespaces | resources::Target::Dashboard | resources::Target::Helm => {}
+            resources::Target::Namespaces
+            | resources::Target::Dashboard
+            | resources::Target::Helm => {}
             resources::Target::Generic => {
-                generic = Some(open_generic(client, rt, &tx, &mut activity, remembered, state.namespace.clone(), state.sort.resource));
+                generic = Some(open_generic(
+                    client,
+                    rt,
+                    &tx,
+                    &mut activity,
+                    remembered,
+                    state.namespace.clone(),
+                    state.sort.resource,
+                ));
             }
         }
     }
@@ -2032,11 +2778,17 @@ fn run_app(
 
         // Snapshot of the active level's informer cache; changes as watch events arrive.
         let items: Vec<Item> = match &pods {
-            Some(p) => p.store.state().iter().map(|o| pod_item(o, p.scope.is_none())).collect(),
+            Some(p) => p
+                .store
+                .state()
+                .iter()
+                .map(|o| pod_item(o, p.scope.is_none()))
+                .collect(),
             None => store.state().iter().map(|o| ns_item(o)).collect(),
         };
         // Copy of the latest usage numbers (cloned so the lock isn't held while drawing).
-        let metrics: Option<MetricsState> = pods.as_ref().map(|p| p.metrics.lock().unwrap().clone());
+        let metrics: Option<MetricsState> =
+            pods.as_ref().map(|p| p.metrics.lock().unwrap().clone());
         // Rows of the open namespace picker, best fuzzy match first. "all namespaces" is not in here:
         // it is always row 0, whatever is typed.
         let ns_matches: Vec<String> = match &modal {
@@ -2046,7 +2798,11 @@ fn run_app(
                     .iter()
                     .filter_map(|n| {
                         let name = n.name_any();
-                        let score = if query.is_empty() { 0 } else { matcher.fuzzy_match(&name, query)? };
+                        let score = if query.is_empty() {
+                            0
+                        } else {
+                            matcher.fuzzy_match(&name, query)?
+                        };
                         Some((score, name))
                     })
                     .collect();
@@ -2056,14 +2812,20 @@ fn run_app(
             _ => vec![],
         };
         let res_matches: Vec<resources::ResourceInfo> = match &modal {
-            Some(Modal::Command { query, .. }) => {
-                resources::matches(resource_types.get().unwrap_or(&builtin_types), query, &matcher)
-            }
+            Some(Modal::Command { query, .. }) => resources::matches(
+                resource_types.get().unwrap_or(&builtin_types),
+                query,
+                &matcher,
+            ),
             _ => vec![],
         };
         let list = lists.last_mut().unwrap();
         let visible = visible_items(&items, list, &matcher);
-        let selected = list.table.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone());
+        let selected = list
+            .table
+            .selected()
+            .and_then(|i| visible.get(i))
+            .map(|n| n.name.clone());
 
         // Details are looked up live each frame; if the object vanished, go back to the list.
         let details: Option<Details> = viewing.as_ref().and_then(|n| match &pods {
@@ -2074,7 +2836,9 @@ fn run_app(
             viewing = None;
         }
         let cdetails = match (&cview, &viewing, &pods) {
-            (Some((c, init)), Some(v), Some(p)) => find_in(&p.store, v).and_then(|o| container_view::build(&o, c, *init)),
+            (Some((c, init)), Some(v), Some(p)) => {
+                find_in(&p.store, v).and_then(|o| container_view::build(&o, c, *init))
+            }
             _ => None,
         };
         if cdetails.is_none() {
@@ -2082,9 +2846,12 @@ fn run_app(
         }
         // Usage history of the open container; None when metrics-server has nothing for it.
         let samples: Option<Vec<Usage>> = match (&cview, &viewing, &pods) {
-            (Some((c, _)), Some(v), Some(p)) => {
-                p.history.lock().unwrap().get(&(v.clone(), c.clone())).map(|d| d.iter().copied().collect())
-            }
+            (Some((c, _)), Some(v), Some(p)) => p
+                .history
+                .lock()
+                .unwrap()
+                .get(&(v.clone(), c.clone()))
+                .map(|d| d.iter().copied().collect()),
             _ => None,
         };
 
@@ -2135,7 +2902,11 @@ fn run_app(
             }
             if cview.is_some() {
                 CONTAINER_HINTS
-            } else if in_pods { POD_DETAILS_HINTS } else { DETAILS_HINTS }
+            } else if in_pods {
+                POD_DETAILS_HINTS
+            } else {
+                DETAILS_HINTS
+            }
         } else if in_pods {
             POD_HINTS
         } else {
@@ -2144,7 +2915,8 @@ fn run_app(
 
         terminal.draw(|frame| {
             let [head, body] =
-                Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Fill(1)]).areas(frame.area());
+                Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Fill(1)])
+                    .areas(frame.area());
             if logs.as_ref().is_some_and(|l| l.is_full()) {
                 // Bare text over the whole screen, so a terminal selection copies only log text.
                 if let Some(l) = &mut logs {
@@ -2170,7 +2942,9 @@ fn run_app(
             } else if let Some(d) = &details {
                 render_details(frame, body, d, &mut container_sel, &status);
             } else {
-                let kind = metrics.as_ref().map_or(ListKind::Namespaces, ListKind::Pods);
+                let kind = metrics
+                    .as_ref()
+                    .map_or(ListKind::Namespaces, ListKind::Pods);
                 render_list(frame, body, kind, &visible, items.len(), list, &status);
             }
             if let Some(m) = &modal {
@@ -2178,14 +2952,19 @@ fn run_app(
             }
             if typing && yaml.is_none() && details.is_none() {
                 // Floating box: 50% wide, 3 rows tall, centered.
-                let popup = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
+                let popup = frame
+                    .area()
+                    .centered(Constraint::Percentage(50), Constraint::Length(3));
                 frame.render_widget(Clear, popup); // wipe what's underneath
                 frame.render_widget(
                     Paragraph::new(list.query.as_str()).block(Block::bordered().title(" Search ")),
                     popup,
                 );
                 // +1 skips the border; cursor sits after the typed text.
-                frame.set_cursor_position((popup.x + 1 + list.query.chars().count() as u16, popup.y + 1));
+                frame.set_cursor_position((
+                    popup.x + 1 + list.query.chars().count() as u16,
+                    popup.y + 1,
+                ));
             }
         })?;
 
@@ -2194,7 +2973,9 @@ fn run_app(
         if !event::poll(Duration::from_millis(wait))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
 
         message.clear();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2208,16 +2989,22 @@ fn run_app(
                         match &pods {
                             _ if generic.is_some() => {
                                 let api = generic.as_ref().unwrap().api_for(&name);
-                                spawn_op(rt, &tx, &mut activity, label, async move { delete_obj(&api, &real).await });
+                                spawn_op(rt, &tx, &mut activity, label, async move {
+                                    delete_obj(&api, &real).await
+                                });
                             }
                             Some(p) => {
                                 let api = p.api_for(&name);
                                 let name = name.rsplit('/').next().unwrap_or(&name).to_string(); // key -> real name
-                                spawn_op(rt, &tx, &mut activity, label, async move { delete_obj(&api, &name).await });
+                                spawn_op(rt, &tx, &mut activity, label, async move {
+                                    delete_obj(&api, &name).await
+                                });
                             }
                             None => {
                                 let api = api.clone();
-                                spawn_op(rt, &tx, &mut activity, label, async move { delete_obj(&api, &name).await });
+                                spawn_op(rt, &tx, &mut activity, label, async move {
+                                    delete_obj(&api, &name).await
+                                });
                             }
                         }
                         viewing = None;
@@ -2225,83 +3012,212 @@ fn run_app(
                     }
                     KeyCode::Char('n') | KeyCode::Enter | KeyCode::Esc => None,
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
-                        Some(Modal::Delete { name, kind, yes: !yes })
+                        Some(Modal::Delete {
+                            name,
+                            kind,
+                            yes: !yes,
+                        })
                     }
                     _ => Some(Modal::Delete { name, kind, yes }),
                 },
-                Modal::Scale { key: k, kind: kd, mut input } => match key.code {
-                    KeyCode::Enter => match (input.parse::<u32>(), &generic) {
-                        (Ok(n), Some(g)) => {
-                            let (api, real) = (g.api_for(&k), k.rsplit('/').next().unwrap_or(&k).to_string());
-                            let done = format!("{real} scaled to {n}");
-                            spawn_op(rt, &tx, &mut activity, format!("scaling {real}"), async move {
-                                patch_message(api, real, k8s_openapi::serde_json::json!({"spec": {"replicas": n}}), done).await
-                            });
-                            None
+                Modal::Scale {
+                    key: k,
+                    kind: kd,
+                    mut input,
+                } => {
+                    match key.code {
+                        KeyCode::Enter => match (input.parse::<u32>(), &generic) {
+                            (Ok(n), Some(g)) => {
+                                let (api, real) = (
+                                    g.api_for(&k),
+                                    k.rsplit('/').next().unwrap_or(&k).to_string(),
+                                );
+                                let done = format!("{real} scaled to {n}");
+                                spawn_op(
+                                    rt,
+                                    &tx,
+                                    &mut activity,
+                                    format!("scaling {real}"),
+                                    async move {
+                                        patch_message(api, real, k8s_openapi::serde_json::json!({"spec": {"replicas": n}}), done).await
+                                    },
+                                );
+                                None
+                            }
+                            _ => Some(Modal::Scale {
+                                key: k,
+                                kind: kd,
+                                input,
+                            }), // not a number yet
+                        },
+                        KeyCode::Esc => None,
+                        KeyCode::Up => Some(Modal::Scale {
+                            key: k,
+                            kind: kd,
+                            input: input
+                                .parse::<u32>()
+                                .map_or(0, |n| n.saturating_add(1))
+                                .to_string(),
+                        }),
+                        KeyCode::Down => Some(Modal::Scale {
+                            key: k,
+                            kind: kd,
+                            input: input
+                                .parse::<u32>()
+                                .map_or(0, |n| n.saturating_sub(1))
+                                .to_string(),
+                        }),
+                        KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 6 => {
+                            input.push(c);
+                            Some(Modal::Scale {
+                                key: k,
+                                kind: kd,
+                                input,
+                            })
                         }
-                        _ => Some(Modal::Scale { key: k, kind: kd, input }), // not a number yet
-                    },
-                    KeyCode::Esc => None,
-                    KeyCode::Up => Some(Modal::Scale { key: k, kind: kd, input: input.parse::<u32>().map_or(0, |n| n.saturating_add(1)).to_string() }),
-                    KeyCode::Down => Some(Modal::Scale { key: k, kind: kd, input: input.parse::<u32>().map_or(0, |n| n.saturating_sub(1)).to_string() }),
-                    KeyCode::Char(c) if c.is_ascii_digit() && input.len() < 6 => {
-                        input.push(c);
-                        Some(Modal::Scale { key: k, kind: kd, input })
+                        KeyCode::Backspace => {
+                            input.pop();
+                            Some(Modal::Scale {
+                                key: k,
+                                kind: kd,
+                                input,
+                            })
+                        }
+                        _ => Some(Modal::Scale {
+                            key: k,
+                            kind: kd,
+                            input,
+                        }),
                     }
-                    KeyCode::Backspace => {
-                        input.pop();
-                        Some(Modal::Scale { key: k, kind: kd, input })
-                    }
-                    _ => Some(Modal::Scale { key: k, kind: kd, input }),
-                },
-                Modal::Restart { key: k, kind: kd, yes } => match key.code {
+                }
+                Modal::Restart {
+                    key: k,
+                    kind: kd,
+                    yes,
+                } => match key.code {
                     code if code == KeyCode::Char('y') || (code == KeyCode::Enter && yes) => {
                         if let Some(g) = &generic {
-                            let (api, real) = (g.api_for(&k), k.rsplit('/').next().unwrap_or(&k).to_string());
+                            let (api, real) = (
+                                g.api_for(&k),
+                                k.rsplit('/').next().unwrap_or(&k).to_string(),
+                            );
                             let stamp = k8s_openapi::jiff::Timestamp::now().to_string();
                             // what `kubectl rollout restart` does: a new annotation changes the template, so the controller rolls the pods
                             let patch = k8s_openapi::serde_json::json!({"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": stamp}}}}});
                             let done = format!("{real} restarting");
-                            spawn_op(rt, &tx, &mut activity, format!("restarting {real}"), async move { patch_message(api, real, patch, done).await });
+                            spawn_op(
+                                rt,
+                                &tx,
+                                &mut activity,
+                                format!("restarting {real}"),
+                                async move { patch_message(api, real, patch, done).await },
+                            );
                         }
                         None
                     }
                     KeyCode::Char('n') | KeyCode::Enter | KeyCode::Esc => None,
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => Some(Modal::Restart { key: k, kind: kd, yes: !yes }),
-                    _ => Some(Modal::Restart { key: k, kind: kd, yes }),
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::Char('h' | 'l') => {
+                        Some(Modal::Restart {
+                            key: k,
+                            kind: kd,
+                            yes: !yes,
+                        })
+                    }
+                    _ => Some(Modal::Restart {
+                        key: k,
+                        kind: kd,
+                        yes,
+                    }),
                 },
-                Modal::Contexts { mut query, sel, names, current } => {
+                Modal::Contexts {
+                    mut query,
+                    sel,
+                    names,
+                    current,
+                } => {
                     let found = context_matches(&names, &query);
                     let sel = sel.min(found.len().saturating_sub(1));
                     match key.code {
                         KeyCode::Enter => match found.get(sel) {
-                            Some(c) if *c != current => return Ok(Exit::Switch { context: c.clone(), state }),
+                            Some(c) if *c != current => {
+                                return Ok(Exit::Switch {
+                                    context: c.clone(),
+                                    state,
+                                });
+                            }
                             _ => None,
                         },
                         KeyCode::Esc => None,
-                        KeyCode::Down | KeyCode::Tab => Some(Modal::Contexts { query, sel: (sel + 1).min(found.len().saturating_sub(1)), names, current }),
-                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Contexts { query, sel: sel.saturating_sub(1), names, current }),
-                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Contexts { query, sel: (sel + 1).min(found.len().saturating_sub(1)), names, current }),
-                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Contexts { query, sel: sel.saturating_sub(1), names, current }),
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Contexts {
+                            query,
+                            sel: (sel + 1).min(found.len().saturating_sub(1)),
+                            names,
+                            current,
+                        }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Contexts {
+                            query,
+                            sel: sel.saturating_sub(1),
+                            names,
+                            current,
+                        }),
+                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Contexts {
+                            query,
+                            sel: (sel + 1).min(found.len().saturating_sub(1)),
+                            names,
+                            current,
+                        }),
+                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Contexts {
+                            query,
+                            sel: sel.saturating_sub(1),
+                            names,
+                            current,
+                        }),
                         KeyCode::Char(c) if !ctrl => {
                             query.push(c);
-                            Some(Modal::Contexts { query, sel: 0, names, current })
+                            Some(Modal::Contexts {
+                                query,
+                                sel: 0,
+                                names,
+                                current,
+                            })
                         }
                         KeyCode::Backspace => {
                             query.pop();
-                            Some(Modal::Contexts { query, sel: 0, names, current })
+                            Some(Modal::Contexts {
+                                query,
+                                sel: 0,
+                                names,
+                                current,
+                            })
                         }
-                        _ => Some(Modal::Contexts { query, sel, names, current }),
+                        _ => Some(Modal::Contexts {
+                            query,
+                            sel,
+                            names,
+                            current,
+                        }),
                     }
                 }
                 Modal::Help(_) => None, // any key closes it
                 Modal::Images { title, rows, sel } => match key.code {
                     KeyCode::Esc | KeyCode::Char('q' | 'i') => None,
-                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Images { sel: (sel + 1).min(rows.len().saturating_sub(1)), title, rows }),
-                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Images { sel: sel.saturating_sub(1), title, rows }),
+                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Images {
+                        sel: (sel + 1).min(rows.len().saturating_sub(1)),
+                        title,
+                        rows,
+                    }),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Images {
+                        sel: sel.saturating_sub(1),
+                        title,
+                        rows,
+                    }),
                     _ => Some(Modal::Images { title, rows, sel }),
                 },
-                Modal::Namespaces { mut query, sel, current } => {
+                Modal::Namespaces {
+                    mut query,
+                    sel,
+                    current,
+                } => {
                     let sel = sel.min(ns_matches.len());
                     match key.code {
                         KeyCode::Enter => {
@@ -2315,35 +3231,84 @@ fn run_app(
                                     // same resource type, new namespace
                                     activity.finish(old.loading);
                                     let info = old.info.clone();
-                                    generic = Some(open_generic(client, rt, &tx, &mut activity, info, scope, state.sort.resource));
+                                    generic = Some(open_generic(
+                                        client,
+                                        rt,
+                                        &tx,
+                                        &mut activity,
+                                        info,
+                                        scope,
+                                        state.sort.resource,
+                                    ));
                                 } else {
                                     if let Some(old) = pods.take() {
                                         activity.finish(old.loading); // dropping `old` aborts its watchers
                                     }
-                                    pods = Some(open_pods(client, rt, &tx, &mut activity, scope, None));
-                                    *lists.last_mut().unwrap() = ListView::sorted(state.sort.resource);
+                                    pods = Some(open_pods(
+                                        client,
+                                        rt,
+                                        &tx,
+                                        &mut activity,
+                                        scope,
+                                        None,
+                                    ));
+                                    *lists.last_mut().unwrap() =
+                                        ListView::sorted(state.sort.resource);
                                     viewing = None;
                                 }
                             }
                             None
                         }
                         KeyCode::Esc => None,
-                        KeyCode::Down | KeyCode::Tab => Some(Modal::Namespaces { query, sel: (sel + 1).min(ns_matches.len()), current }),
-                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Namespaces { query, sel: sel.saturating_sub(1), current }),
-                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Namespaces { query, sel: (sel + 1).min(ns_matches.len()), current }),
-                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Namespaces { query, sel: sel.saturating_sub(1), current }),
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Namespaces {
+                            query,
+                            sel: (sel + 1).min(ns_matches.len()),
+                            current,
+                        }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Namespaces {
+                            query,
+                            sel: sel.saturating_sub(1),
+                            current,
+                        }),
+                        KeyCode::Char('j' | 'n') if ctrl => Some(Modal::Namespaces {
+                            query,
+                            sel: (sel + 1).min(ns_matches.len()),
+                            current,
+                        }),
+                        KeyCode::Char('k' | 'p') if ctrl => Some(Modal::Namespaces {
+                            query,
+                            sel: sel.saturating_sub(1),
+                            current,
+                        }),
                         KeyCode::Char(c) if !ctrl => {
                             query.push(c);
-                            Some(Modal::Namespaces { query, sel: 1, current }) // best match preselected
+                            Some(Modal::Namespaces {
+                                query,
+                                sel: 1,
+                                current,
+                            }) // best match preselected
                         }
                         KeyCode::Backspace => {
                             query.pop();
-                            Some(Modal::Namespaces { sel: usize::from(!query.is_empty()), query, current })
+                            Some(Modal::Namespaces {
+                                sel: usize::from(!query.is_empty()),
+                                query,
+                                current,
+                            })
                         }
-                        _ => Some(Modal::Namespaces { query, sel, current }),
+                        _ => Some(Modal::Namespaces {
+                            query,
+                            sel,
+                            current,
+                        }),
                     }
                 }
-                Modal::Drain { node, mut opts, focus, yes } => {
+                Modal::Drain {
+                    node,
+                    mut opts,
+                    focus,
+                    yes,
+                } => {
                     let (mut run, mut close) = (false, false);
                     let toggle = |opts: &mut drain::DrainOpts, i: usize| match i {
                         0 => opts.ignore_daemonsets = !opts.ignore_daemonsets,
@@ -2356,10 +3321,16 @@ fn run_app(
                     match key.code {
                         KeyCode::Char('y') => run = true,
                         KeyCode::Esc | KeyCode::Char('n') => close = true,
-                        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => focus = (focus + 1).min(4),
-                        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => focus = focus.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                            focus = (focus + 1).min(4)
+                        }
+                        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                            focus = focus.saturating_sub(1)
+                        }
                         KeyCode::Char(' ') => toggle(&mut opts, focus),
-                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if focus == 4 => yes = !yes,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') if focus == 4 => {
+                            yes = !yes
+                        }
                         KeyCode::Enter if focus < 4 => toggle(&mut opts, focus),
                         KeyCode::Enter if yes => run = true,
                         KeyCode::Enter => close = true, // "No" focused
@@ -2367,12 +3338,23 @@ fn run_app(
                     }
                     if run {
                         let (client, label) = (client.clone(), format!("draining {node}"));
-                        spawn_op(rt, &tx, &mut activity, label, drain::drain(client, node, opts));
+                        spawn_op(
+                            rt,
+                            &tx,
+                            &mut activity,
+                            label,
+                            drain::drain(client, node, opts),
+                        );
                         None
                     } else if close {
                         None
                     } else {
-                        Some(Modal::Drain { node, opts, focus, yes })
+                        Some(Modal::Drain {
+                            node,
+                            opts,
+                            focus,
+                            yes,
+                        })
                     }
                 }
                 Modal::Command { mut query, sel } => {
@@ -2387,7 +3369,13 @@ fn run_app(
                                         .as_ref()
                                         .map(|g| g.scope.clone())
                                         .or_else(|| pods.as_ref().map(|p| p.scope.clone()))
-                                        .unwrap_or_else(|| if dashboard.is_some() { state.namespace.clone() } else { selected.clone() });
+                                        .unwrap_or_else(|| {
+                                            if dashboard.is_some() {
+                                                state.namespace.clone()
+                                            } else {
+                                                selected.clone()
+                                            }
+                                        });
                                     dashboard = None;
                                     helm = None;
                                     tree = None;
@@ -2398,19 +3386,33 @@ fn run_app(
                                     match r.target() {
                                         resources::Target::Pods => {
                                             if pods.is_none() {
-                                                pods = Some(open_pods(client, rt, &tx, &mut activity, scope, None));
+                                                pods = Some(open_pods(
+                                                    client,
+                                                    rt,
+                                                    &tx,
+                                                    &mut activity,
+                                                    scope,
+                                                    None,
+                                                ));
                                                 lists.push(ListView::sorted(state.sort.resource));
                                             }
                                         }
-                                        resources::Target::Namespaces | resources::Target::Dashboard | resources::Target::Helm => {
+                                        resources::Target::Namespaces
+                                        | resources::Target::Dashboard
+                                        | resources::Target::Helm => {
                                             parked.clear();
                                             if let Some(p) = pods.take() {
                                                 activity.finish(p.loading);
                                                 lists.pop();
                                             }
                                             match r.target() {
-                                                resources::Target::Dashboard => dashboard = Some(dashboard::Dashboard::open(rt, client)),
-                                                resources::Target::Helm => helm = Some(helm::HelmView::open(rt, client)),
+                                                resources::Target::Dashboard => {
+                                                    dashboard =
+                                                        Some(dashboard::Dashboard::open(rt, client))
+                                                }
+                                                resources::Target::Helm => {
+                                                    helm = Some(helm::HelmView::open(rt, client))
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -2419,7 +3421,15 @@ fn run_app(
                                                 activity.finish(p.loading);
                                                 lists.pop();
                                             }
-                                            generic = Some(open_generic(client, rt, &tx, &mut activity, r.clone(), scope, state.sort.resource));
+                                            generic = Some(open_generic(
+                                                client,
+                                                rt,
+                                                &tx,
+                                                &mut activity,
+                                                r.clone(),
+                                                scope,
+                                                state.sort.resource,
+                                            ));
                                         }
                                     }
                                 }
@@ -2427,8 +3437,14 @@ fn run_app(
                             None
                         }
                         KeyCode::Esc => None,
-                        KeyCode::Down | KeyCode::Tab => Some(Modal::Command { query, sel: (sel + 1).min(res_matches.len().saturating_sub(1)) }),
-                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Command { query, sel: sel.saturating_sub(1) }),
+                        KeyCode::Down | KeyCode::Tab => Some(Modal::Command {
+                            query,
+                            sel: (sel + 1).min(res_matches.len().saturating_sub(1)),
+                        }),
+                        KeyCode::Up | KeyCode::BackTab => Some(Modal::Command {
+                            query,
+                            sel: sel.saturating_sub(1),
+                        }),
                         KeyCode::Char(c) if !ctrl => {
                             query.push(c);
                             Some(Modal::Command { query, sel: 0 })
@@ -2447,15 +3463,25 @@ fn run_app(
                         None
                     }
                     KeyCode::Esc | KeyCode::Char('q') => None,
-                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Containers { sel: (sel + 1).min(names.len()), pod, names }),
-                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Containers { sel: sel.saturating_sub(1), pod, names }),
+                    KeyCode::Char('j') | KeyCode::Down => Some(Modal::Containers {
+                        sel: (sel + 1).min(names.len()),
+                        pod,
+                        names,
+                    }),
+                    KeyCode::Char('k') | KeyCode::Up => Some(Modal::Containers {
+                        sel: sel.saturating_sub(1),
+                        pod,
+                        names,
+                    }),
                     _ => Some(Modal::Containers { pod, names, sel }),
                 },
                 Modal::New(mut input) => match key.code {
                     KeyCode::Enter if !input.is_empty() => {
                         let api = api.clone();
                         let label = format!("creating {input}");
-                        spawn_op(rt, &tx, &mut activity, label, async move { create_ns(&api, &input).await });
+                        spawn_op(rt, &tx, &mut activity, label, async move {
+                            create_ns(&api, &input).await
+                        });
                         None
                     }
                     KeyCode::Esc => None,
@@ -2473,7 +3499,12 @@ fn run_app(
             continue;
         }
         if ctrl && key.code == KeyCode::Char('x') && !typing {
-            modal = Some(Modal::Contexts { query: String::new(), sel: 0, names: context_names(), current: info.context.clone() });
+            modal = Some(Modal::Contexts {
+                query: String::new(),
+                sel: 0,
+                names: context_names(),
+                current: info.context.clone(),
+            });
             continue;
         }
         if key.code == KeyCode::Char('?') && !typing {
@@ -2503,7 +3534,12 @@ fn run_app(
             match t.handle_key(key) {
                 Some(tree_view::Act::Close) => tree = None,
                 Some(tree_view::Act::Quit) => return Ok(Exit::Quit),
-                Some(tree_view::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                Some(tree_view::Act::Command) => {
+                    modal = Some(Modal::Command {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                }
                 None => {}
             }
             continue;
@@ -2515,8 +3551,15 @@ fn run_app(
                     dashboard = Some(dashboard::Dashboard::open(rt, client));
                 }
                 Some(helm::Act::Quit) => return Ok(Exit::Quit),
-                Some(helm::Act::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
-                Some(helm::Act::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
+                Some(helm::Act::Command) => {
+                    modal = Some(Modal::Command {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                }
+                Some(helm::Act::Tree(src)) => {
+                    tree = Some(tree_view::TreeView::open(rt, client, src))
+                }
                 Some(helm::Act::Values(name, json)) => {
                     let empty = json.as_object().is_none_or(|m| m.is_empty());
                     match serde_yaml_ng::to_value(&json) {
@@ -2533,8 +3576,19 @@ fn run_app(
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(Exit::Quit),
                 KeyCode::Char('j') | KeyCode::Down => d.step(1),
                 KeyCode::Char('k') | KeyCode::Up => d.step(-1),
-                KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
-                KeyCode::Char('i') => modal = Some(Modal::Images { title: "Cluster images".into(), rows: d.images(), sel: 0 }),
+                KeyCode::Char(':') => {
+                    modal = Some(Modal::Command {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                }
+                KeyCode::Char('i') => {
+                    modal = Some(Modal::Images {
+                        title: "Cluster images".into(),
+                        rows: d.images(),
+                        sel: 0,
+                    })
+                }
                 _ => {}
             }
             continue;
@@ -2551,7 +3605,9 @@ fn run_app(
                 }
                 Some(generic_view::Action::Open { targets, path }) => {
                     let types = resource_types.get().unwrap_or(&builtin_types);
-                    let found = targets.into_iter().find_map(|t| Some((resources::find(types, t.group, t.plural)?, t.keep)));
+                    let found = targets
+                        .into_iter()
+                        .find_map(|t| Some((resources::find(types, t.group, t.plural)?, t.keep)));
                     match found {
                         Some((info, keep)) => {
                             parked.extend(generic.take());
@@ -2563,18 +3619,35 @@ fn run_app(
                     }
                 }
                 Some(generic_view::Action::Quit) => return Ok(Exit::Quit),
-                Some(generic_view::Action::Tree(src)) => tree = Some(tree_view::TreeView::open(rt, client, src)),
-                Some(generic_view::Action::Images { title, rows }) => modal = Some(Modal::Images { title, rows, sel: 0 }),
+                Some(generic_view::Action::Tree(src)) => {
+                    tree = Some(tree_view::TreeView::open(rt, client, src))
+                }
+                Some(generic_view::Action::Images { title, rows }) => {
+                    modal = Some(Modal::Images {
+                        title,
+                        rows,
+                        sel: 0,
+                    })
+                }
                 Some(generic_view::Action::Cordon(node)) => {
                     let (client, label) = (client.clone(), format!("cordoning {node}"));
-                    spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, true).await });
+                    spawn_op(rt, &tx, &mut activity, label, async move {
+                        drain::cordon_message(&client, &node, true).await
+                    });
                 }
                 Some(generic_view::Action::Uncordon(node)) => {
                     let (client, label) = (client.clone(), format!("uncordoning {node}"));
-                    spawn_op(rt, &tx, &mut activity, label, async move { drain::cordon_message(&client, &node, false).await });
+                    spawn_op(rt, &tx, &mut activity, label, async move {
+                        drain::cordon_message(&client, &node, false).await
+                    });
                 }
                 Some(generic_view::Action::Drain(node)) => {
-                    modal = Some(Modal::Drain { node, opts: drain::DrainOpts::default(), focus: 4, yes: false });
+                    modal = Some(Modal::Drain {
+                        node,
+                        opts: drain::DrainOpts::default(),
+                        focus: 4,
+                        yes: false,
+                    });
                 }
 
                 Some(generic_view::Action::Pods { scope, filter }) => {
@@ -2583,14 +3656,30 @@ fn run_app(
                         activity.finish(old.loading);
                         lists.pop();
                     }
-                    pods = Some(open_pods(client, rt, &tx, &mut activity, scope, Some(filter)));
+                    pods = Some(open_pods(
+                        client,
+                        rt,
+                        &tx,
+                        &mut activity,
+                        scope,
+                        Some(filter),
+                    ));
                     lists.push(ListView::sorted(state.sort.resource));
                 }
                 Some(generic_view::Action::PickNamespace) => {
                     let current = generic.as_ref().and_then(|g| g.scope.clone());
-                    modal = Some(Modal::Namespaces { query: String::new(), sel: 0, current });
+                    modal = Some(Modal::Namespaces {
+                        query: String::new(),
+                        sel: 0,
+                        current,
+                    });
                 }
-                Some(generic_view::Action::Command) => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                Some(generic_view::Action::Command) => {
+                    modal = Some(Modal::Command {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                }
                 Some(generic_view::Action::Copy(text)) => {
                     message = match copy(&mut clipboard, &text) {
                         Ok(()) => format!("copied {} lines", text.lines().count()),
@@ -2598,14 +3687,43 @@ fn run_app(
                     };
                 }
                 Some(generic_view::Action::Scale(key)) => {
-                    let current = generic.as_ref().and_then(|g| find_in(g.store(), &key)).and_then(|o| o.data["spec"]["replicas"].as_u64()).unwrap_or(1);
-                    modal = Some(Modal::Scale { key, kind: kind.clone(), input: current.to_string() });
+                    let current = generic
+                        .as_ref()
+                        .and_then(|g| find_in(g.store(), &key))
+                        .and_then(|o| o.data["spec"]["replicas"].as_u64())
+                        .unwrap_or(1);
+                    modal = Some(Modal::Scale {
+                        key,
+                        kind: kind.clone(),
+                        input: current.to_string(),
+                    });
                 }
-                Some(generic_view::Action::Restart(key)) => modal = Some(Modal::Restart { key, kind: kind.clone(), yes: false }),
-                Some(generic_view::Action::Delete(name)) => modal = Some(Modal::Delete { name, kind: kind.clone(), yes: false }),
+                Some(generic_view::Action::Restart(key)) => {
+                    modal = Some(Modal::Restart {
+                        key,
+                        kind: kind.clone(),
+                        yes: false,
+                    })
+                }
+                Some(generic_view::Action::Delete(name)) => {
+                    modal = Some(Modal::Delete {
+                        name,
+                        kind: kind.clone(),
+                        yes: false,
+                    })
+                }
                 Some(generic_view::Action::Edit(name)) => {
                     if let Some(g) = &generic {
-                        edit_flow(terminal, rt, &tx, &mut activity, &g.api_for(&name), g.store(), &name, &mut message);
+                        edit_flow(
+                            terminal,
+                            rt,
+                            &tx,
+                            &mut activity,
+                            &g.api_for(&name),
+                            g.store(),
+                            &name,
+                            &mut message,
+                        );
                     }
                 }
             }
@@ -2622,7 +3740,10 @@ fn run_app(
                 KeyCode::Char('j') | KeyCode::Down => env_sel.select_next(),
                 KeyCode::Char('k') | KeyCode::Up => env_sel.select_previous(),
                 KeyCode::Char('l') => {
-                    logs_target = viewing.clone().zip(cview.clone()).map(|(pod, (c, _))| (pod, Some(c)));
+                    logs_target = viewing
+                        .clone()
+                        .zip(cview.clone())
+                        .map(|(pod, (c, _))| (pod, Some(c)));
                 }
                 KeyCode::Char('g') => env_sel.select_first(),
                 KeyCode::Char('G') => env_sel.select_last(),
@@ -2638,7 +3759,10 @@ fn run_app(
                 KeyCode::Char('j') | KeyCode::Down if in_pods => container_sel.select_next(),
                 KeyCode::Char('k') | KeyCode::Up if in_pods => container_sel.select_previous(),
                 KeyCode::Enter if in_pods => {
-                    let rows = details.as_ref().and_then(|d| d.pod.as_ref()).map(|x| &x.containers);
+                    let rows = details
+                        .as_ref()
+                        .and_then(|d| d.pod.as_ref())
+                        .map(|x| &x.containers);
                     let i = container_sel.selected().unwrap_or(0);
                     // select_next can run past the end; the table clamps it only when drawing.
                     if let Some(r) = rows.and_then(|r| r.get(i.min(r.len().saturating_sub(1)))) {
@@ -2647,7 +3771,11 @@ fn run_app(
                     }
                 }
                 KeyCode::Char('d') if ctrl => {
-                    modal = viewing.clone().map(|name| Modal::Delete { name, kind: kind.clone(), yes: false });
+                    modal = viewing.clone().map(|name| Modal::Delete {
+                        name,
+                        kind: kind.clone(),
+                        yes: false,
+                    });
                 }
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
                 KeyCode::Esc | KeyCode::Char('q' | 'd') => viewing = None,
@@ -2676,15 +3804,28 @@ fn run_app(
         } else {
             match key.code {
                 KeyCode::Char('d') if ctrl => {
-                    modal = selected.clone().map(|name| Modal::Delete { name, kind: kind.clone(), yes: false });
+                    modal = selected.clone().map(|name| Modal::Delete {
+                        name,
+                        kind: kind.clone(),
+                        yes: false,
+                    });
                 }
                 KeyCode::Char('n') if ctrl && !in_pods => modal = Some(Modal::New(String::new())),
                 KeyCode::Char('n') if ctrl => {
                     let current = pods.as_ref().and_then(|p| p.scope.clone());
-                    modal = Some(Modal::Namespaces { query: String::new(), sel: 0, current });
+                    modal = Some(Modal::Namespaces {
+                        query: String::new(),
+                        sel: 0,
+                        current,
+                    });
                 }
                 KeyCode::Char('/') => typing = true,
-                KeyCode::Char(':') => modal = Some(Modal::Command { query: String::new(), sel: 0 }),
+                KeyCode::Char(':') => {
+                    modal = Some(Modal::Command {
+                        query: String::new(),
+                        sel: 0,
+                    })
+                }
                 KeyCode::Char('>') => list.sort_col = list.sort_col.step(1),
                 KeyCode::Char('<') => list.sort_col = list.sort_col.step(-1),
                 KeyCode::Char('A') => list.ascending = !list.ascending,
@@ -2698,10 +3839,16 @@ fn run_app(
                 KeyCode::Enter if !in_pods => enter_pods = selected.clone(),
                 KeyCode::Enter => {
                     // one container: straight to its logs; several: ask which
-                    let names = pods.as_ref().and_then(|p| find_in(&p.store, selected.as_deref()?)).map(|o| container_names(&o)).unwrap_or_default();
+                    let names = pods
+                        .as_ref()
+                        .and_then(|p| find_in(&p.store, selected.as_deref()?))
+                        .map(|o| container_names(&o))
+                        .unwrap_or_default();
                     match (selected.clone(), names.len()) {
                         (Some(pod), 1) => logs_target = Some((pod, None)),
-                        (Some(pod), n) if n > 1 => modal = Some(Modal::Containers { pod, names, sel: 0 }),
+                        (Some(pod), n) if n > 1 => {
+                            modal = Some(Modal::Containers { pod, names, sel: 0 })
+                        }
                         _ => {}
                     }
                 }
@@ -2743,8 +3890,26 @@ fn run_app(
         }
         if let Some(name) = edit_target {
             match &pods {
-                Some(p) => edit_flow(terminal, rt, &tx, &mut activity, &p.api_for(&name), &p.store, &name, &mut message),
-                None => edit_flow(terminal, rt, &tx, &mut activity, api, store, &name, &mut message),
+                Some(p) => edit_flow(
+                    terminal,
+                    rt,
+                    &tx,
+                    &mut activity,
+                    &p.api_for(&name),
+                    &p.store,
+                    &name,
+                    &mut message,
+                ),
+                None => edit_flow(
+                    terminal,
+                    rt,
+                    &tx,
+                    &mut activity,
+                    api,
+                    store,
+                    &name,
+                    &mut message,
+                ),
             }
         }
     }
@@ -2760,13 +3925,19 @@ mod tests {
 
     fn pod_with(phase: &str, waiting: Option<&str>) -> Pod {
         let state = waiting.map(|r| ContainerState {
-            waiting: Some(ContainerStateWaiting { reason: Some(r.into()), ..Default::default() }),
+            waiting: Some(ContainerStateWaiting {
+                reason: Some(r.into()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         Pod {
             status: Some(PodStatus {
                 phase: Some(phase.into()),
-                container_statuses: Some(vec![ContainerStatus { state, ..Default::default() }]),
+                container_statuses: Some(vec![ContainerStatus {
+                    state,
+                    ..Default::default()
+                }]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2776,8 +3947,14 @@ mod tests {
     #[test]
     fn parses_namespace_and_resource() {
         let p = |a: &[&str]| parse_args(a.iter().map(|s| s.to_string()));
-        assert_eq!(p(&["-n", "kube-system", "po"]).unwrap(), (Some("kube-system".into()), Some("po".into())));
-        assert_eq!(p(&["svc", "--namespace=x"]).unwrap(), (Some("x".into()), Some("svc".into())));
+        assert_eq!(
+            p(&["-n", "kube-system", "po"]).unwrap(),
+            (Some("kube-system".into()), Some("po".into()))
+        );
+        assert_eq!(
+            p(&["svc", "--namespace=x"]).unwrap(),
+            (Some("x".into()), Some("svc".into()))
+        );
         assert_eq!(p(&[]).unwrap(), (None, None));
         assert!(p(&["-n"]).is_err());
         assert!(p(&["a", "b"]).is_err());
@@ -2787,7 +3964,10 @@ mod tests {
     #[test]
     fn pod_status_prefers_container_reason_over_phase() {
         assert_eq!(pod_status(&pod_with("Running", None)), "Running");
-        assert_eq!(pod_status(&pod_with("Running", Some("CrashLoopBackOff"))), "CrashLoopBackOff");
+        assert_eq!(
+            pod_status(&pod_with("Running", Some("CrashLoopBackOff"))),
+            "CrashLoopBackOff"
+        );
 
         let mut p = pod_with("Running", None);
         p.metadata.deletion_timestamp = Some(Time(jiff::Timestamp::now()));
@@ -2796,7 +3976,12 @@ mod tests {
 
     #[test]
     fn bar_fills_by_limit_then_request() {
-        let text = |l: Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let text = |l: Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
         assert_eq!(text(usage_bar(Some(500), None, Some(500))), "⣿⣿⣿⣿⣿⣿");
         assert_eq!(text(usage_bar(Some(250), Some(100), Some(500))), "⣿⣿⣿⣀⣀⣀");
         assert_eq!(text(usage_bar(None, Some(1), Some(1))), "⣀⣀⣀⣀⣀⣀");
@@ -2805,7 +3990,8 @@ mod tests {
 
     #[test]
     fn container_rows_show_state_and_last_termination() {
-        let pod: Pod = serde_yaml_ng::from_str(r#"{
+        let pod: Pod = serde_yaml_ng::from_str(
+            r#"{
             "metadata": {"name": "p"},
             "spec": {"containers": [{"name": "app", "image": "reg.io/team/app:1"}]},
             "status": {"containerStatuses": [{
@@ -2813,12 +3999,16 @@ mod tests {
                 "state": {"waiting": {"reason": "CrashLoopBackOff"}},
                 "lastState": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}
             }]}
-        }"#)
+        }"#,
+        )
         .unwrap();
         let rows = container_rows(&pod);
         assert_eq!(rows[0].state, "CrashLoopBackOff");
         assert_eq!(rows[0].last, "OOMKilled (137)");
-        assert_eq!((rows[0].restarts, rows[0].image.as_str()), (4, "team/app:1"));
+        assert_eq!(
+            (rows[0].restarts, rows[0].image.as_str()),
+            (4, "team/app:1")
+        );
     }
 
     #[test]
@@ -2851,7 +4041,10 @@ mod tests {
         let (store, mut writer) = reflector::store::<Pod>();
         writer.apply_watcher_event(&watcher::Event::Apply(pod("a")));
         writer.apply_watcher_event(&watcher::Event::Apply(pod("b")));
-        assert_eq!(find_in(&store, "b/web").unwrap().namespace().as_deref(), Some("b"));
+        assert_eq!(
+            find_in(&store, "b/web").unwrap().namespace().as_deref(),
+            Some("b")
+        );
         assert!(find_in(&store, "c/web").is_none());
         assert!(find_in(&store, "web").is_some());
         assert_eq!(pod_item(&pod("a"), true).name, "a/web");
@@ -2881,12 +4074,35 @@ mod tests {
         };
         let mut m = MetricsState::default();
         m.available = Some(true);
-        m.usage.insert("n1".into(), Usage { cpu: 2000, mem: 2 << 30 });
+        m.usage.insert(
+            "n1".into(),
+            Usage {
+                cpu: 2000,
+                mem: 2 << 30,
+            },
+        );
         let mut term = Terminal::new(TestBackend::new(200, 6)).unwrap();
         let mut list = ListView::sorted(state::Sort::default());
-        term.draw(|f| render_list(f, f.area(), ListKind::Nodes(&m), &[&item], 1, &mut list, "")).unwrap();
-        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for want in ["ROLES", "control-plane", "2000m/4000m", "2.0Gi/8.0Gi", "55/110", "10.0.0.5", "v1.30.2", "Ubuntu 24.04", "⣿"] {
+        term.draw(|f| render_list(f, f.area(), ListKind::Nodes(&m), &[&item], 1, &mut list, ""))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for want in [
+            "ROLES",
+            "control-plane",
+            "2000m/4000m",
+            "2.0Gi/8.0Gi",
+            "55/110",
+            "10.0.0.5",
+            "v1.30.2",
+            "Ubuntu 24.04",
+            "⣿",
+        ] {
             assert!(text.contains(want), "missing {want}");
         }
     }
@@ -2894,11 +4110,30 @@ mod tests {
     #[test]
     fn drain_popup_shows_the_four_options_and_their_state() {
         use ratatui::{Terminal, backend::TestBackend};
-        let modal = Modal::Drain { node: "n1".into(), opts: drain::DrainOpts::default(), focus: 4, yes: false };
+        let modal = Modal::Drain {
+            node: "n1".into(),
+            opts: drain::DrainOpts::default(),
+            focus: 4,
+            yes: false,
+        };
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
         term.draw(|f| render_modal(f, &modal, &[], &[])).unwrap();
-        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for want in ["Drain n1?", "[x] Ignore DaemonSets", "[ ] Force", "[ ] Disable eviction", "[ ] Delete emptyDir data", "Yes", "No"] {
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for want in [
+            "Drain n1?",
+            "[x] Ignore DaemonSets",
+            "[ ] Force",
+            "[ ] Disable eviction",
+            "[ ] Delete emptyDir data",
+            "Yes",
+            "No",
+        ] {
             assert!(text.contains(want), "missing {want}");
         }
     }
@@ -2913,13 +4148,45 @@ mod tests {
             labels: vec![],
             pod: None,
             node: None,
-            extra: Some(vec![("3/3".into(), Color::Green), ("3".into(), Color::Reset), ("3".into(), Color::Green), ("RollingUpdate".into(), Color::Reset), ("web:1".into(), Color::Reset)]),
+            extra: Some(vec![
+                ("3/3".into(), Color::Green),
+                ("3".into(), Color::Reset),
+                ("3".into(), Color::Green),
+                ("RollingUpdate".into(), Color::Reset),
+                ("web:1".into(), Color::Reset),
+            ]),
         };
         let mut term = Terminal::new(TestBackend::new(140, 6)).unwrap();
         let mut list = ListView::sorted(state::Sort::default());
-        term.draw(|f| render_list(f, f.area(), ListKind::Pane(panes::Pane::Deployment), &[&item], 1, &mut list, "")).unwrap();
-        let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for want in ["UP-TO-DATE", "AVAILABLE", "STRATEGY", "IMAGES", "Available", "3/3", "RollingUpdate", "web:1"] {
+        term.draw(|f| {
+            render_list(
+                f,
+                f.area(),
+                ListKind::Pane(panes::Pane::Deployment),
+                &[&item],
+                1,
+                &mut list,
+                "",
+            )
+        })
+        .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for want in [
+            "UP-TO-DATE",
+            "AVAILABLE",
+            "STRATEGY",
+            "IMAGES",
+            "Available",
+            "3/3",
+            "RollingUpdate",
+            "web:1",
+        ] {
             assert!(text.contains(want), "missing {want}");
         }
     }
@@ -2934,17 +4201,38 @@ mod tests {
             labels: vec![],
             pod: None,
             node: None,
-            extra: Some(vec![("2".into(), Color::Reset), ("a, b".into(), Color::Reset)]),
+            extra: Some(vec![
+                ("2".into(), Color::Reset),
+                ("a, b".into(), Color::Reset),
+            ]),
         };
         let draw = |status: &str| {
             let it = item(status);
             let mut term = Terminal::new(TestBackend::new(80, 5)).unwrap();
             let mut list = ListView::sorted(state::Sort::default());
-            term.draw(|f| render_list(f, f.area(), ListKind::Pane(panes::Pane::ConfigMap), &[&it], 1, &mut list, "")).unwrap();
-            term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+            term.draw(|f| {
+                render_list(
+                    f,
+                    f.area(),
+                    ListKind::Pane(panes::Pane::ConfigMap),
+                    &[&it],
+                    1,
+                    &mut list,
+                    "",
+                )
+            })
+            .unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
         };
         let (without, with) = (draw(""), draw("Ready"));
-        assert!(!without.contains("STATUS") && without.contains("KEYS") && without.contains("a, b"));
+        assert!(
+            !without.contains("STATUS") && without.contains("KEYS") && without.contains("a, b")
+        );
         assert!(with.contains("STATUS") && with.contains("Ready") && with.contains("a, b"));
     }
 
@@ -2967,8 +4255,14 @@ mod tests {
 
     #[test]
     fn context_picker_filters_fuzzily_and_lists_all_when_empty() {
-        let names: Vec<String> = ["prod-eu", "staging", "prod-us"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(context_matches(&names, ""), ["prod-eu", "prod-us", "staging"]);
+        let names: Vec<String> = ["prod-eu", "staging", "prod-us"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            context_matches(&names, ""),
+            ["prod-eu", "prod-us", "staging"]
+        );
         assert_eq!(context_matches(&names, "stg"), ["staging"]);
         assert_eq!(context_matches(&names, "prod").len(), 2);
         assert!(context_matches(&names, "zzz").is_empty());
@@ -2977,9 +4271,17 @@ mod tests {
     #[test]
     fn scale_and_restart_apply_to_the_right_kinds() {
         use panes::Pane::*;
-        assert!([Deployment, ReplicaSet, StatefulSet, ReplicationController].iter().all(|w| panes::scalable(*w)));
+        assert!(
+            [Deployment, ReplicaSet, StatefulSet, ReplicationController]
+                .iter()
+                .all(|w| panes::scalable(*w))
+        );
         assert!(!panes::scalable(DaemonSet) && !panes::scalable(Job));
-        assert!([Deployment, StatefulSet, DaemonSet].iter().all(|w| panes::restartable(*w)));
+        assert!(
+            [Deployment, StatefulSet, DaemonSet]
+                .iter()
+                .all(|w| panes::restartable(*w))
+        );
         assert!(!panes::restartable(ReplicaSet) && !panes::restartable(Service));
     }
 }

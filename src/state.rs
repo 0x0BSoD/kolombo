@@ -1,8 +1,14 @@
 //! Choices remembered between runs, in `$HOME/.config/kolombo/state` (YAML).
 
-use crate::{Column, ListView, resources::{self, ResourceInfo}};
+use crate::{
+    Column, ListView,
+    resources::{self, ResourceInfo},
+};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 /// Which screen was open.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
@@ -22,13 +28,19 @@ pub struct Sort {
 
 impl Default for Sort {
     fn default() -> Self {
-        Self { column: Column::Name, ascending: true }
+        Self {
+            column: Column::Name,
+            ascending: true,
+        }
     }
 }
 
 impl Sort {
     pub fn of(list: &ListView) -> Self {
-        Self { column: list.sort_col, ascending: list.ascending }
+        Self {
+            column: list.sort_col,
+            ascending: list.ascending,
+        }
     }
 }
 
@@ -57,8 +69,16 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        let pods = resources::builtin().into_iter().find(|r| r.name == "pods").unwrap_or_default();
-        Self { open: Level::default(), resource: pods, namespace: None, sort: Sorts::default() }
+        let pods = resources::builtin()
+            .into_iter()
+            .find(|r| r.name == "pods")
+            .unwrap_or_default();
+        Self {
+            open: Level::default(),
+            resource: pods,
+            namespace: None,
+            sort: Sorts::default(),
+        }
     }
 }
 
@@ -70,15 +90,27 @@ impl State {
     /// Reads the file, creating it (and its directory) with defaults when missing.
     /// The String is a warning for the status line, empty when all is well.
     pub fn load(path: Option<&Path>) -> (State, String) {
-        let Some(path) = path else { return (State::default(), "state: $HOME is not set, nothing is saved".into()) };
+        let Some(path) = path else {
+            return (
+                State::default(),
+                "state: $HOME is not set, nothing is saved".into(),
+            );
+        };
         match fs::read_to_string(path) {
             Ok(text) => match serde_yaml_ng::from_str(&text) {
                 Ok(state) => (state, String::new()),
-                Err(e) => (State::default(), format!("state file ignored, it will be overwritten: {e}")),
+                Err(e) => (
+                    State::default(),
+                    format!("state file ignored, it will be overwritten: {e}"),
+                ),
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let state = State::default();
-                let note = state.save(path).err().map(|e| format!("state not created: {e}")).unwrap_or_default();
+                let note = state
+                    .save(path)
+                    .err()
+                    .map(|e| format!("state not created: {e}"))
+                    .unwrap_or_default();
                 (state, note)
             }
             Err(e) => (State::default(), format!("state not read: {e}")),
@@ -91,7 +123,10 @@ impl State {
             fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_yaml_ng::to_string(self).map_err(io::Error::other)?)?;
+        fs::write(
+            &tmp,
+            serde_yaml_ng::to_string(self).map_err(io::Error::other)?,
+        )?;
         fs::rename(tmp, path)
     }
 }
@@ -115,7 +150,14 @@ mod tests {
         state.namespace = Some("team-a".into());
         let yaml = serde_yaml_ng::to_string(&state).unwrap();
         println!("{yaml}");
-        for want in ["open: resource", "group: example.com", "version: v1alpha1", "kind: Widget", "name: widgets", "namespace: team-a"] {
+        for want in [
+            "open: resource",
+            "group: example.com",
+            "version: v1alpha1",
+            "kind: Widget",
+            "name: widgets",
+            "namespace: team-a",
+        ] {
             assert!(yaml.contains(want), "missing {want}");
         }
         assert_eq!(serde_yaml_ng::from_str::<State>(&yaml).unwrap(), state);
@@ -131,14 +173,24 @@ mod tests {
         let saved = State {
             namespace: Some("kube-system".into()),
             open: Level::Resource,
-            sort: Sorts { resource: Sort { column: Column::Age, ascending: false }, ..Default::default() },
+            sort: Sorts {
+                resource: Sort {
+                    column: Column::Age,
+                    ascending: false,
+                },
+                ..Default::default()
+            },
             ..Default::default()
         };
         saved.save(&path).unwrap();
         assert_eq!(State::load(Some(&path)).0, saved);
 
         // a partial or damaged file never stops the app from starting
-        fs::write(&path, "namespace: x\nsort:\n  pods: { column: age, ascending: false }\n").unwrap();
+        fs::write(
+            &path,
+            "namespace: x\nsort:\n  pods: { column: age, ascending: false }\n",
+        )
+        .unwrap();
         let (old, _) = State::load(Some(&path));
         assert_eq!(old.namespace.as_deref(), Some("x"));
         assert_eq!(old.sort.resource.column, Column::Age); // `pods:` is the old name of `resource:`

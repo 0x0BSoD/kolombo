@@ -53,14 +53,28 @@ pub enum Pane {
 
 impl Pane {
     fn is_apps(self) -> bool {
-        matches!(self, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::ControllerRevision)
+        matches!(
+            self,
+            Pane::Deployment
+                | Pane::ReplicaSet
+                | Pane::StatefulSet
+                | Pane::DaemonSet
+                | Pane::ControllerRevision
+        )
     }
 
     fn is_net(self) -> bool {
         matches!(
             self,
-            Pane::Ingress | Pane::IngressClass | Pane::NetworkPolicy | Pane::GatewayClass | Pane::Gateway | Pane::ListenerSet | Pane::Route
-                | Pane::ReferenceGrant | Pane::BackendTlsPolicy
+            Pane::Ingress
+                | Pane::IngressClass
+                | Pane::NetworkPolicy
+                | Pane::GatewayClass
+                | Pane::Gateway
+                | Pane::ListenerSet
+                | Pane::Route
+                | Pane::ReferenceGrant
+                | Pane::BackendTlsPolicy
         )
     }
 
@@ -69,7 +83,10 @@ impl Pane {
     }
 
     fn is_argo(self) -> bool {
-        matches!(self, Pane::Application | Pane::ApplicationSet | Pane::AppProject)
+        matches!(
+            self,
+            Pane::Application | Pane::ApplicationSet | Pane::AppProject
+        )
     }
 
     fn is_core(self) -> bool {
@@ -118,9 +135,21 @@ pub fn columns(w: Pane) -> Vec<(&'static str, Constraint)> {
     let n = |t, w| (t, Constraint::Length(w));
     let images = ("IMAGES", Constraint::Fill(2));
     match w {
-        Pane::Deployment => vec![n("READY", 7), n("UP-TO-DATE", 10), n("AVAILABLE", 9), n("STRATEGY", 14), images],
+        Pane::Deployment => vec![
+            n("READY", 7),
+            n("UP-TO-DATE", 10),
+            n("AVAILABLE", 9),
+            n("STRATEGY", 14),
+            images,
+        ],
         Pane::ReplicaSet => vec![n("READY", 7), n("DESIRED", 7), n("OWNER", 28), images],
-        Pane::StatefulSet => vec![n("READY", 7), n("UP-TO-DATE", 10), n("STRATEGY", 14), ("SERVICE", Constraint::Fill(1)), images],
+        Pane::StatefulSet => vec![
+            n("READY", 7),
+            n("UP-TO-DATE", 10),
+            n("STRATEGY", 14),
+            ("SERVICE", Constraint::Fill(1)),
+            images,
+        ],
         Pane::DaemonSet => vec![
             n("DESIRED", 7),
             n("CURRENT", 7),
@@ -202,10 +231,21 @@ pub fn label_selector(o: &DynamicObject) -> String {
 pub fn selector_string(sel: &Value) -> String {
     let structured = sel.get("matchLabels").is_some() || sel.get("matchExpressions").is_some();
     let labels = if structured { &sel["matchLabels"] } else { sel };
-    let mut parts: Vec<String> = labels.as_object().into_iter().flatten().map(|(k, v)| format!("{k}={}", text(v))).collect();
+    let mut parts: Vec<String> = labels
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| format!("{k}={}", text(v)))
+        .collect();
     for e in sel["matchExpressions"].as_array().into_iter().flatten() {
         let key = text(&e["key"]);
-        let values = e["values"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join(",");
+        let values = e["values"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join(",");
         match e["operator"].as_str() {
             Some("In") => parts.push(format!("{key} in ({values})")),
             Some("NotIn") => parts.push(format!("{key} notin ({values})")),
@@ -219,7 +259,10 @@ pub fn selector_string(sel: &Value) -> String {
 
 /// `s`: kinds with a replica count.
 pub fn scalable(w: Pane) -> bool {
-    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::ReplicationController)
+    matches!(
+        w,
+        Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::ReplicationController
+    )
 }
 
 /// `R`: kinds whose pod template can be re-stamped to roll the pods.
@@ -229,7 +272,16 @@ pub fn restartable(w: Pane) -> bool {
 
 /// Whether Enter on this kind should open its pods.
 pub fn has_pods(w: Pane) -> bool {
-    matches!(w, Pane::Deployment | Pane::ReplicaSet | Pane::StatefulSet | Pane::DaemonSet | Pane::Job | Pane::Service | Pane::ReplicationController)
+    matches!(
+        w,
+        Pane::Deployment
+            | Pane::ReplicaSet
+            | Pane::StatefulSet
+            | Pane::DaemonSet
+            | Pane::Job
+            | Pane::Service
+            | Pane::ReplicationController
+    )
 }
 
 fn strategy(o: &DynamicObject, key: &str) -> String {
@@ -237,11 +289,17 @@ fn strategy(o: &DynamicObject, key: &str) -> String {
 }
 
 pub(crate) fn owner(o: &DynamicObject) -> String {
-    o.owner_references().first().map(|r| format!("{}/{}", r.kind.to_lowercase(), r.name)).unwrap_or_default()
+    o.owner_references()
+        .first()
+        .map(|r| format!("{}/{}", r.kind.to_lowercase(), r.name))
+        .unwrap_or_default()
 }
 
 fn condition<'a>(o: &'a DynamicObject, kind: &str) -> Option<&'a Value> {
-    o.data["status"]["conditions"].as_array()?.iter().find(|c| c["type"].as_str() == Some(kind))
+    o.data["status"]["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["type"].as_str() == Some(kind))
 }
 
 /// One word for the STATUS column.
@@ -266,7 +324,9 @@ pub fn status(w: Pane, o: &DynamicObject) -> String {
                 "Paused".into()
             } else if condition(o, "ReplicaFailure").is_some_and(|c| c["status"] == "True") {
                 "ReplicaFailure".into()
-            } else if condition(o, "Progressing").is_some_and(|c| c["reason"] == "ProgressDeadlineExceeded") {
+            } else if condition(o, "Progressing")
+                .is_some_and(|c| c["reason"] == "ProgressDeadlineExceeded")
+            {
                 "ProgressDeadlineExceeded".into()
             } else if want == 0 {
                 "ScaledToZero".into()
@@ -282,7 +342,8 @@ pub fn status(w: Pane, o: &DynamicObject) -> String {
             let ready = num(&st["readyReplicas"]);
             if want == 0 {
                 "ScaledToZero".into()
-            } else if w == Pane::StatefulSet && num(&st["updatedReplicas"]) < want && ready >= want {
+            } else if w == Pane::StatefulSet && num(&st["updatedReplicas"]) < want && ready >= want
+            {
                 "Updating".into()
             } else if ready >= want {
                 "Ready".into()
@@ -325,7 +386,10 @@ pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
     match w {
         Pane::Deployment | Pane::StatefulSet => {
             let (want, ready) = (desired(o), num(&st["readyReplicas"]));
-            let mut v = vec![(format!("{ready}/{want}"), ratio(ready, want)), count(&st["updatedReplicas"])];
+            let mut v = vec![
+                (format!("{ready}/{want}"), ratio(ready, want)),
+                count(&st["updatedReplicas"]),
+            ];
             if w == Pane::Deployment {
                 let available = num(&st["availableReplicas"]);
                 v.push((available.to_string(), ratio(available, want)));
@@ -339,7 +403,12 @@ pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
         }
         Pane::ReplicaSet => {
             let (want, ready) = (desired(o), num(&st["readyReplicas"]));
-            vec![(format!("{ready}/{want}"), ratio(ready, want)), (want.to_string(), Color::Reset), plain(owner(o)), plain(images(o))]
+            vec![
+                (format!("{ready}/{want}"), ratio(ready, want)),
+                (want.to_string(), Color::Reset),
+                plain(owner(o)),
+                plain(images(o)),
+            ]
         }
         Pane::DaemonSet => {
             let want = num(&st["desiredNumberScheduled"]);
@@ -357,7 +426,11 @@ pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
                 (ready.to_string(), ratio(ready, want)),
                 count(&st["updatedNumberScheduled"]),
                 (available.to_string(), ratio(available, want)),
-                plain(if selector.is_empty() { "<none>".into() } else { selector }),
+                plain(if selector.is_empty() {
+                    "<none>".into()
+                } else {
+                    selector
+                }),
                 plain(images(o)),
             ]
         }
@@ -367,7 +440,11 @@ pub fn cells(w: Pane, o: &DynamicObject) -> Vec<(String, Color)> {
 }
 
 pub(crate) fn mark(ok: bool) -> Span<'static> {
-    if ok { Span::styled("✓", Style::new().fg(Color::Green)) } else { Span::styled("✗", Style::new().fg(Color::Red)) }
+    if ok {
+        Span::styled("✓", Style::new().fg(Color::Green))
+    } else {
+        Span::styled("✗", Style::new().fg(Color::Red))
+    }
 }
 
 /// A label on the first line only, so multi-line values stay aligned.
@@ -405,7 +482,13 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
     if !status.is_empty() {
         rows.push(field("Status", status_span(&status)));
     }
-    let counts = |pairs: &[(&str, u64)]| pairs.iter().map(|(k, v)| format!("{v} {k}")).collect::<Vec<_>>().join(" · ");
+    let counts = |pairs: &[(&str, u64)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{v} {k}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
     match w {
         Pane::Deployment => {
             rows.push(field(
@@ -420,11 +503,18 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
             ));
             let rolling = &spec["strategy"]["rollingUpdate"];
             let detail = if rolling.is_object() {
-                format!(" (maxSurge {}, maxUnavailable {})", text(&rolling["maxSurge"]), text(&rolling["maxUnavailable"]))
+                format!(
+                    " (maxSurge {}, maxUnavailable {})",
+                    text(&rolling["maxSurge"]),
+                    text(&rolling["maxUnavailable"])
+                )
             } else {
                 String::new()
             };
-            rows.push(field("Strategy", Span::raw(format!("{}{detail}", strategy(o, "strategy")))));
+            rows.push(field(
+                "Strategy",
+                Span::raw(format!("{}{detail}", strategy(o, "strategy"))),
+            ));
             rows.push(field(
                 "Rollout",
                 Span::styled(
@@ -433,31 +523,70 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
                         text(&spec["revisionHistoryLimit"]),
                         text(&spec["progressDeadlineSeconds"]),
                         num(&spec["minReadySeconds"]),
-                        if spec["paused"] == true { " · PAUSED" } else { "" }
+                        if spec["paused"] == true {
+                            " · PAUSED"
+                        } else {
+                            ""
+                        }
                     ),
                     dim,
                 ),
             ));
         }
         Pane::ReplicaSet => {
-            rows.push(field("Replicas", Span::raw(counts(&[("desired", desired(o)), ("current", num(&st["replicas"])), ("ready", num(&st["readyReplicas"])), ("available", num(&st["availableReplicas"]))]))));
+            rows.push(field(
+                "Replicas",
+                Span::raw(counts(&[
+                    ("desired", desired(o)),
+                    ("current", num(&st["replicas"])),
+                    ("ready", num(&st["readyReplicas"])),
+                    ("available", num(&st["availableReplicas"])),
+                ])),
+            ));
             rows.push(field("Owner", Span::raw(owner(o))));
             if let Some(rev) = o.annotations().get("deployment.kubernetes.io/revision") {
                 rows.push(field("Revision", Span::raw(rev.clone())));
             }
         }
         Pane::StatefulSet => {
-            rows.push(field("Replicas", Span::raw(counts(&[("desired", desired(o)), ("current", num(&st["currentReplicas"])), ("updated", num(&st["updatedReplicas"])), ("ready", num(&st["readyReplicas"]))]))));
+            rows.push(field(
+                "Replicas",
+                Span::raw(counts(&[
+                    ("desired", desired(o)),
+                    ("current", num(&st["currentReplicas"])),
+                    ("updated", num(&st["updatedReplicas"])),
+                    ("ready", num(&st["readyReplicas"])),
+                ])),
+            ));
             rows.push(field("Strategy", Span::raw(strategy(o, "updateStrategy"))));
-            rows.push(field("Pods", Span::raw(format!("{} start/stop order", text(&spec["podManagementPolicy"])))));
+            rows.push(field(
+                "Pods",
+                Span::raw(format!(
+                    "{} start/stop order",
+                    text(&spec["podManagementPolicy"])
+                )),
+            ));
             rows.push(field("Service", Span::raw(text(&spec["serviceName"]))));
             let claims: Vec<String> = spec["volumeClaimTemplates"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .map(|c| format!("{} ({})", text(&c["metadata"]["name"]), text(&c["spec"]["resources"]["requests"]["storage"])))
+                .map(|c| {
+                    format!(
+                        "{} ({})",
+                        text(&c["metadata"]["name"]),
+                        text(&c["spec"]["resources"]["requests"]["storage"])
+                    )
+                })
                 .collect();
-            rows.push(field("Storage", if claims.is_empty() { Span::styled("<none>", dim) } else { Span::raw(claims.join(", ")) }));
+            rows.push(field(
+                "Storage",
+                if claims.is_empty() {
+                    Span::styled("<none>", dim)
+                } else {
+                    Span::raw(claims.join(", "))
+                },
+            ));
         }
         Pane::DaemonSet => {
             rows.push(field(
@@ -482,7 +611,10 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
     if w != Pane::ControllerRevision {
         rows.push(field("Selector", Span::raw(selector(o))));
         let containers = pod_containers(o);
-        let imgs = containers.iter().map(|(n, i)| vec![Span::styled(format!("{n}  "), dim), Span::raw(i.clone())]).collect();
+        let imgs = containers
+            .iter()
+            .map(|(n, i)| vec![Span::styled(format!("{n}  "), dim), Span::raw(i.clone())])
+            .collect();
         rows.extend(lines("Images", imgs));
         let conditions: Vec<Vec<Span>> = st["conditions"]
             .as_array()
@@ -491,13 +623,20 @@ pub fn info_rows(w: Pane, o: &DynamicObject) -> Vec<Line<'static>> {
             .map(|c| {
                 let ok = c["status"] == "True";
                 let reason = text(&c["reason"]);
-                vec![mark(ok), Span::raw(format!(" {}  ", text(&c["type"]))), Span::styled(reason, dim)]
+                vec![
+                    mark(ok),
+                    Span::raw(format!(" {}  ", text(&c["type"]))),
+                    Span::styled(reason, dim),
+                ]
             })
             .collect();
         rows.extend(lines("Conditions", conditions));
     }
     rows.push(field("Created", Span::raw(created_text(&o.metadata))));
-    rows.push(field("UID", Span::raw(o.metadata.uid.clone().unwrap_or_default())));
+    rows.push(field(
+        "UID",
+        Span::raw(o.metadata.uid.clone().unwrap_or_default()),
+    ));
     rows
 }
 
@@ -515,37 +654,68 @@ mod tests {
 
     #[test]
     fn deployment_row_shows_rollout_state() {
-        let d = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"},
+        let d = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "web"},
             "spec": {"replicas": 3, "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": "25%", "maxUnavailable": 1}},
                      "selector": {"matchLabels": {"app": "web"}},
                      "template": {"spec": {"containers": [{"name": "a", "image": "reg.io/team/web:1"}, {"name": "b", "image": "envoy:1"}]}}},
             "status": {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 3, "availableReplicas": 2,
-                       "conditions": [{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"}]}}"#);
-        assert_eq!(cell_text(Pane::Deployment, &d), ["2/3", "3", "2", "RollingUpdate", "team/web:1 +1"]);
-        assert_eq!(columns(Pane::Deployment).len(), cells(Pane::Deployment, &d).len());
+                       "conditions": [{"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable"}]}}"#,
+        );
+        assert_eq!(
+            cell_text(Pane::Deployment, &d),
+            ["2/3", "3", "2", "RollingUpdate", "team/web:1 +1"]
+        );
+        assert_eq!(
+            columns(Pane::Deployment).len(),
+            cells(Pane::Deployment, &d).len()
+        );
         assert_eq!(status(Pane::Deployment, &d), "Unavailable"); // 2 of 3 available
-        let text: String = info_rows(Pane::Deployment, &d).iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("maxSurge 25%, maxUnavailable 1") && text.contains("app=web") && text.contains("MinimumReplicasAvailable"));
+        let text: String = info_rows(Pane::Deployment, &d)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("maxSurge 25%, maxUnavailable 1")
+                && text.contains("app=web")
+                && text.contains("MinimumReplicasAvailable")
+        );
 
-        let scaled = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 0}}"#);
+        let scaled = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 0}}"#,
+        );
         assert_eq!(status(Pane::Deployment, &scaled), "ScaledToZero");
-        let rolling = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 3}, "status": {"replicas": 4, "updatedReplicas": 1, "availableReplicas": 3}}"#);
+        let rolling = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {"replicas": 3}, "status": {"replicas": 4, "updatedReplicas": 1, "availableReplicas": 3}}"#,
+        );
         assert_eq!(status(Pane::Deployment, &rolling), "Updating");
     }
 
     #[test]
     fn selector_covers_labels_and_expressions() {
-        let o = obj(r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "w"}, "spec": {"selector": {
+        let o = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "w"}, "spec": {"selector": {
             "matchLabels": {"app": "web"},
             "matchExpressions": [{"key": "tier", "operator": "In", "values": ["a", "b"]}, {"key": "x", "operator": "NotIn", "values": ["y"]},
-                                 {"key": "has", "operator": "Exists"}, {"key": "canary", "operator": "DoesNotExist"}]}}}"#);
-        assert_eq!(label_selector(&o), "app=web,tier in (a,b),x notin (y),has,!canary");
+                                 {"key": "has", "operator": "Exists"}, {"key": "canary", "operator": "DoesNotExist"}]}}}"#,
+        );
+        assert_eq!(
+            label_selector(&o),
+            "app=web,tier in (a,b),x notin (y),has,!canary"
+        );
     }
 
     #[test]
     fn every_kind_has_one_cell_per_column() {
         let o = obj(r#"{"apiVersion": "apps/v1", "kind": "X", "metadata": {"name": "x"}}"#);
-        for w in [Pane::Deployment, Pane::ReplicaSet, Pane::StatefulSet, Pane::DaemonSet, Pane::ControllerRevision] {
+        for w in [
+            Pane::Deployment,
+            Pane::ReplicaSet,
+            Pane::StatefulSet,
+            Pane::DaemonSet,
+            Pane::ControllerRevision,
+        ] {
             assert_eq!(columns(w).len(), cells(w, &o).len(), "{w:?}");
             assert!(!info_rows(w, &o).is_empty());
         }
@@ -553,12 +723,19 @@ mod tests {
 
     #[test]
     fn daemonset_and_replicaset_status() {
-        let ds = obj(r#"{"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": "d"},
-            "status": {"desiredNumberScheduled": 5, "currentNumberScheduled": 5, "numberReady": 4, "updatedNumberScheduled": 5, "numberAvailable": 4}}"#);
+        let ds = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": "d"},
+            "status": {"desiredNumberScheduled": 5, "currentNumberScheduled": 5, "numberReady": 4, "updatedNumberScheduled": 5, "numberAvailable": 4}}"#,
+        );
         assert_eq!(status(Pane::DaemonSet, &ds), "NotReady");
-        assert_eq!(cell_text(Pane::DaemonSet, &ds)[..5], ["5", "5", "4", "5", "4"]);
-        let rs = obj(r#"{"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {"name": "r", "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "web", "uid": "u", "controller": true}]},
-            "spec": {"replicas": 0}}"#);
+        assert_eq!(
+            cell_text(Pane::DaemonSet, &ds)[..5],
+            ["5", "5", "4", "5", "4"]
+        );
+        let rs = obj(
+            r#"{"apiVersion": "apps/v1", "kind": "ReplicaSet", "metadata": {"name": "r", "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment", "name": "web", "uid": "u", "controller": true}]},
+            "spec": {"replicas": 0}}"#,
+        );
         assert_eq!(status(Pane::ReplicaSet, &rs), "ScaledToZero");
         assert_eq!(cell_text(Pane::ReplicaSet, &rs)[2], "deployment/web");
     }

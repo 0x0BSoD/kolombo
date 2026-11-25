@@ -1,13 +1,19 @@
 //! A list for any resource type, CRDs included. Objects are read as untyped `DynamicObject`s, so
 //! the columns are the ones every object has: name, a guessed status, age and labels.
 
-use crate::{
-    Details, ListKind, MetricsState, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS, Hints, NODE_DETAILS_HINTS, NODE_HINTS, PodFilter, WORKLOAD_HINTS, WORKLOAD_HINTS_NS, HOP_HINTS, HOP_HINTS_NS, SCALE_HINTS, SCALE_HINTS_NS, ROUTES_HINTS, ROUTES_HINTS_NS, Item, ListView, YAML_HINTS, created_secs, created_text,
-    field, labels_of, render_details, render_list, status_span, visible_items, yaml_view::{Outcome, YamlView},
-};
 use crate::resources::ResourceInfo;
-use fuzzy_matcher::skim::SkimMatcherV2;
+use crate::{
+    Details, GENERIC_DETAILS_HINTS, GENERIC_DETAILS_HINTS_NS, GENERIC_HINTS, GENERIC_HINTS_NS,
+    HOP_HINTS, HOP_HINTS_NS, Hints, Item, ListKind, ListView, MetricsState, NODE_DETAILS_HINTS,
+    NODE_HINTS, PodFilter, ROUTES_HINTS, ROUTES_HINTS_NS, SCALE_HINTS, SCALE_HINTS_NS,
+    WORKLOAD_HINTS, WORKLOAD_HINTS_NS, YAML_HINTS, created_secs, created_text, field, labels_of,
+    render_details, render_list, status_span, visible_items,
+    yaml_view::{Outcome, YamlView},
+};
+use crate::{net_panes, nodes, panes};
 use futures::StreamExt;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client, ResourceExt,
     core::{ApiResource, DynamicObject, GroupVersionKind},
@@ -20,29 +26,40 @@ use ratatui::{
     text::Span,
     widgets::{Block, Clear, Paragraph, TableState},
 };
-use k8s_openapi::api::core::v1::Pod;
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
-use crate::{net_panes, nodes, panes};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::task::JoinHandle;
 
 /// What the main loop must do after a key.
 pub enum Action {
     Close,
     Quit,
-    Pods { scope: Option<String>, filter: PodFilter }, // Enter on a node or workload: its pods
+    Pods {
+        scope: Option<String>,
+        filter: PodFilter,
+    }, // Enter on a node or workload: its pods
     Tree(crate::tree_view::Source), // Enter on an Argo CD Application: its resource tree
-    Open { targets: Vec<net_panes::Target>, path: Vec<String> }, // Enter on a Gateway, route...: the next list down
+    Open {
+        targets: Vec<net_panes::Target>,
+        path: Vec<String>,
+    }, // Enter on a Gateway, route...: the next list down
     Cordon(String),
     Uncordon(String),
     Drain(String), // opens the drain options popup
-    Command, // open the `:` picker
+    Command,       // open the `:` picker
     PickNamespace, // open the namespace picker
     Copy(String),
     Delete(String), // list key
     Edit(String),
     Scale(String),   // list key: ask for a replica count
     Restart(String), // list key: ask to roll the pods
-    Images { title: String, rows: Vec<(String, usize)> }, // `i` on a node: images its pods run
+    Images {
+        title: String,
+        rows: Vec<(String, usize)>,
+    }, // `i` on a node: images its pods run
 }
 
 /// Hides every object that is not a child of the one we drilled down from. Done on our side because
@@ -64,7 +81,7 @@ pub struct GenericView {
     usage_task: Option<JoinHandle<()>>,
     pods: Option<Store<Pod>>, // every pod of the cluster, only to count them per node
     pods_task: Option<JoinHandle<()>>,
-    pub loading: u64, // Activity id of the "loading" spinner
+    pub loading: u64,          // Activity id of the "loading" spinner
     error: Arc<Mutex<String>>, // last watch error, shown in the status line
     pub list: ListView,
     viewing: Option<String>,
@@ -91,9 +108,16 @@ pub fn dyn_status(o: &DynamicObject) -> String {
     }
     let conditions = status["conditions"].as_array();
     let pick = conditions.and_then(|cs| {
-        ["Ready", "Available", "Healthy", "Synced", "Established", "Succeeded"]
-            .iter()
-            .find_map(|want| cs.iter().find(|c| c["type"].as_str() == Some(want)))
+        [
+            "Ready",
+            "Available",
+            "Healthy",
+            "Synced",
+            "Established",
+            "Succeeded",
+        ]
+        .iter()
+        .find_map(|want| cs.iter().find(|c| c["type"].as_str() == Some(want)))
     });
     if let Some(c) = pick {
         let kind = c["type"].as_str().unwrap_or_default();
@@ -103,13 +127,25 @@ pub fn dyn_status(o: &DynamicObject) -> String {
             _ => "Unknown".to_string(),
         };
     }
-    status["state"].as_str().map(String::from).unwrap_or_default()
+    status["state"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_default()
 }
 
 /// `nodes` = pod counts per node name when this is the node list.
-fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>, workload: Option<panes::Pane>) -> Item {
+fn dyn_item(
+    o: &DynamicObject,
+    all: bool,
+    nodes: Option<&HashMap<String, usize>>,
+    workload: Option<panes::Pane>,
+) -> Item {
     Item {
-        name: if all { format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any()) } else { o.name_any() },
+        name: if all {
+            format!("{}/{}", o.namespace().unwrap_or_default(), o.name_any())
+        } else {
+            o.name_any()
+        },
         status: match (nodes, workload) {
             (Some(_), _) => nodes::status(o),
             (_, Some(w)) => panes::status(w, o),
@@ -123,18 +159,36 @@ fn dyn_item(o: &DynamicObject, all: bool, nodes: Option<&HashMap<String, usize>>
     }
 }
 
-fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usage>, pods: usize) -> Details {
+fn details_of(
+    info: &ResourceInfo,
+    o: &DynamicObject,
+    usage: Option<&crate::Usage>,
+    pods: usize,
+) -> Details {
     if nodes::is_nodes(info) {
-        return Details { meta: o.metadata.clone(), info: nodes::info_rows(o), pod: None, node: Some(nodes::extra(o, usage, pods)) };
+        return Details {
+            meta: o.metadata.clone(),
+            info: nodes::info_rows(o),
+            pod: None,
+            node: Some(nodes::extra(o, usage, pods)),
+        };
     }
     if let Some(w) = panes::kind_of(info) {
         let mut rows = panes::info_rows(w, o);
         if let Some(ns) = o.namespace() {
             rows.insert(0, field("Namespace", Span::raw(ns)));
         }
-        return Details { meta: o.metadata.clone(), info: rows, pod: None, node: None };
+        return Details {
+            meta: o.metadata.clone(),
+            info: rows,
+            pod: None,
+            node: None,
+        };
     }
-    let mut rows = vec![field("Kind", Span::raw(format!("{} ({})", info.kind, info.api_version())))];
+    let mut rows = vec![field(
+        "Kind",
+        Span::raw(format!("{} ({})", info.kind, info.api_version())),
+    )];
     if let Some(ns) = o.namespace() {
         rows.push(field("Namespace", Span::raw(ns)));
     }
@@ -143,12 +197,27 @@ fn details_of(info: &ResourceInfo, o: &DynamicObject, usage: Option<&crate::Usag
         rows.push(field("Status", status_span(&status)));
     }
     rows.push(field("Created", Span::raw(created_text(&o.metadata))));
-    rows.push(field("UID", Span::raw(o.metadata.uid.clone().unwrap_or_default())));
-    Details { meta: o.metadata.clone(), info: rows, pod: None, node: None }
+    rows.push(field(
+        "UID",
+        Span::raw(o.metadata.uid.clone().unwrap_or_default()),
+    ));
+    Details {
+        meta: o.metadata.clone(),
+        info: rows,
+        pod: None,
+        node: None,
+    }
 }
 
 impl GenericView {
-    pub fn open(rt: &tokio::runtime::Handle, client: &Client, info: ResourceInfo, scope: Option<String>, sort: crate::state::Sort, loading: u64) -> Self {
+    pub fn open(
+        rt: &tokio::runtime::Handle,
+        client: &Client,
+        info: ResourceInfo,
+        scope: Option<String>,
+        sort: crate::state::Sort,
+        loading: u64,
+    ) -> Self {
         let gvk = GroupVersionKind::gvk(&info.group, &info.version, &info.kind);
         let resource = ApiResource::from_gvk_with_plural(&gvk, &info.name);
         let scope = if info.namespaced { scope } else { None };
@@ -159,7 +228,9 @@ impl GenericView {
         let writer = reflector::store::Writer::<DynamicObject>::new(resource.clone());
         let store = writer.as_reader();
         let error: Arc<Mutex<String>> = Arc::default();
-        let stream = reflector(writer, watcher(api, watcher::Config::default())).default_backoff().applied_objects();
+        let stream = reflector(writer, watcher(api, watcher::Config::default()))
+            .default_backoff()
+            .applied_objects();
         let err = error.clone();
         let task = rt.spawn(stream.for_each(move |item| {
             // Keep the newest watch error (RBAC, type without watch support) for the status line.
@@ -183,7 +254,12 @@ impl GenericView {
         });
         let (pods, pods_task) = if nodes::is_nodes(&info) {
             let (store, writer) = reflector::store::<Pod>();
-            let stream = reflector(writer, watcher(Api::<Pod>::all(client.clone()), watcher::Config::default())).default_backoff().applied_objects();
+            let stream = reflector(
+                writer,
+                watcher(Api::<Pod>::all(client.clone()), watcher::Config::default()),
+            )
+            .default_backoff()
+            .applied_objects();
             (Some(store), Some(rt.spawn(stream.for_each(|_| async {}))))
         } else {
             (None, None)
@@ -227,9 +303,18 @@ impl GenericView {
     /// One row per object; node rows carry their pod count.
     fn items(&self) -> Vec<Item> {
         let all = self.all();
-        let counts = self.pods.as_ref().map(nodes::pod_counts).or_else(|| nodes::is_nodes(&self.info).then(HashMap::new));
+        let counts = self
+            .pods
+            .as_ref()
+            .map(nodes::pod_counts)
+            .or_else(|| nodes::is_nodes(&self.info).then(HashMap::new));
         let keep = |o: &&Arc<DynamicObject>| self.filter.as_ref().is_none_or(|f| (f.keep)(o));
-        self.store.state().iter().filter(keep).map(|o| dyn_item(o, all, counts.as_ref(), panes::kind_of(&self.info))).collect()
+        self.store
+            .state()
+            .iter()
+            .filter(keep)
+            .map(|o| dyn_item(o, all, counts.as_ref(), panes::kind_of(&self.info)))
+            .collect()
     }
 
     fn all(&self) -> bool {
@@ -290,7 +375,11 @@ impl GenericView {
         } else if self.scalable() || self.restartable() {
             if ns { SCALE_HINTS_NS } else { SCALE_HINTS }
         } else if pane.is_some_and(panes::has_pods) {
-            if ns { WORKLOAD_HINTS_NS } else { WORKLOAD_HINTS }
+            if ns {
+                WORKLOAD_HINTS_NS
+            } else {
+                WORKLOAD_HINTS
+            }
         } else if pane.is_some_and(net_panes::has_routes) {
             if ns { ROUTES_HINTS_NS } else { ROUTES_HINTS }
         } else if pane.is_some_and(net_panes::has_hop) {
@@ -305,7 +394,11 @@ impl GenericView {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, status: &str) {
         let items = self.items();
         let error = self.error.lock().unwrap().clone();
-        let status = if error.is_empty() { status.to_string() } else { format!("watch error: {error}") };
+        let status = if error.is_empty() {
+            status.to_string()
+        } else {
+            format!("watch error: {error}")
+        };
         if let Some(y) = &mut self.yaml {
             y.render(frame, area, &status);
             return;
@@ -313,9 +406,21 @@ impl GenericView {
         if let Some(key) = &self.viewing {
             match crate::find_in(&self.store, key) {
                 Some(o) => {
-                    let usage = self.usage.as_ref().and_then(|u| u.lock().unwrap().usage.get(key).copied());
-                    let pods = self.pods.as_ref().map_or(0, |p| nodes::pod_counts(p).get(key).copied().unwrap_or(0));
-                    return render_details(frame, area, &details_of(&self.info, &o, usage.as_ref(), pods), &mut TableState::default(), &status);
+                    let usage = self
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.lock().unwrap().usage.get(key).copied());
+                    let pods = self
+                        .pods
+                        .as_ref()
+                        .map_or(0, |p| nodes::pod_counts(p).get(key).copied().unwrap_or(0));
+                    return render_details(
+                        frame,
+                        area,
+                        &details_of(&self.info, &o, usage.as_ref(), pods),
+                        &mut TableState::default(),
+                        &status,
+                    );
                 }
                 None => self.viewing = None, // deleted while open
             }
@@ -328,12 +433,28 @@ impl GenericView {
             (None, Some(w)) => ListKind::Pane(w),
             _ => ListKind::Namespaces,
         };
-        render_list(frame, area, kind, &visible, items.len(), &mut self.list, &status);
+        render_list(
+            frame,
+            area,
+            kind,
+            &visible,
+            items.len(),
+            &mut self.list,
+            &status,
+        );
         if self.typing {
-            let popup = frame.area().centered(Constraint::Percentage(50), Constraint::Length(3));
+            let popup = frame
+                .area()
+                .centered(Constraint::Percentage(50), Constraint::Length(3));
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new(self.list.query.as_str()).block(Block::bordered().title(" Search ")), popup);
-            frame.set_cursor_position((popup.x + 1 + self.list.query.chars().count() as u16, popup.y + 1));
+            frame.render_widget(
+                Paragraph::new(self.list.query.as_str()).block(Block::bordered().title(" Search ")),
+                popup,
+            );
+            frame.set_cursor_position((
+                popup.x + 1 + self.list.query.chars().count() as u16,
+                popup.y + 1,
+            ));
         }
     }
 
@@ -342,7 +463,11 @@ impl GenericView {
         let items = self.items();
         let matcher = SkimMatcherV2::default();
         let visible = visible_items(&items, &self.list, &matcher);
-        self.list.table.selected().and_then(|i| visible.get(i)).map(|n| n.name.clone())
+        self.list
+            .table
+            .selected()
+            .and_then(|i| visible.get(i))
+            .map(|n| n.name.clone())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -364,11 +489,18 @@ impl GenericView {
                 KeyCode::Char('R') if self.restartable() => return Some(Action::Restart(k)),
                 KeyCode::Char('y') => self.open_yaml(&k),
                 KeyCode::Char('i') if node => {
-                    let on_node = |p: &&Arc<Pod>| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(k.as_str());
+                    let on_node = |p: &&Arc<Pod>| {
+                        p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(k.as_str())
+                    };
                     let pods = self.pods.as_ref().map(|s| s.state()).unwrap_or_default();
-                    return Some(Action::Images { title: format!("Images on {k}"), rows: crate::images::counts(pods.iter().filter(on_node).map(|p| &**p)) });
+                    return Some(Action::Images {
+                        title: format!("Images on {k}"),
+                        rows: crate::images::counts(pods.iter().filter(on_node).map(|p| &**p)),
+                    });
                 }
-                KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
+                KeyCode::Char('n') if ctrl && self.can_pick_namespace() => {
+                    return Some(Action::PickNamespace);
+                }
                 KeyCode::Char('c') if node => return Some(Action::Cordon(k)),
                 KeyCode::Char('u') if node => return Some(Action::Uncordon(k)),
                 KeyCode::Char('C') if node => return Some(Action::Drain(k)),
@@ -400,7 +532,9 @@ impl GenericView {
         let selected = self.selected();
         match key.code {
             KeyCode::Char('d') if ctrl => return selected.map(Action::Delete),
-            KeyCode::Char('n') if ctrl && self.can_pick_namespace() => return Some(Action::PickNamespace),
+            KeyCode::Char('n') if ctrl && self.can_pick_namespace() => {
+                return Some(Action::PickNamespace);
+            }
             KeyCode::Char('/') => self.typing = true,
             KeyCode::Char(':') => return Some(Action::Command),
             KeyCode::Char('>') => self.list.sort_col = self.list.sort_col.step(1),
@@ -409,7 +543,11 @@ impl GenericView {
             KeyCode::Enter if node => {
                 return selected.map(|n| Action::Pods {
                     scope: None,
-                    filter: PodFilter { crumbs: self.path_to(&n), fields: Some(format!("spec.nodeName={n}")), labels: None },
+                    filter: PodFilter {
+                        crumbs: self.path_to(&n),
+                        fields: Some(format!("spec.nodeName={n}")),
+                        labels: None,
+                    },
                 });
             }
             KeyCode::Enter if panes::kind_of(&self.info).is_some_and(panes::has_pods) => {
@@ -464,12 +602,23 @@ impl GenericView {
     fn hop(&self, key: &str, routes: bool) -> Option<Action> {
         let w = panes::kind_of(&self.info)?;
         let o = crate::find_in(&self.store, key)?;
-        let hop = if routes { net_panes::routes(w, &o) } else { net_panes::enter(w, &o) }?;
+        let hop = if routes {
+            net_panes::routes(w, &o)
+        } else {
+            net_panes::enter(w, &o)
+        }?;
         let path = self.path_to(key);
         Some(match hop {
             net_panes::Hop::Open(targets) => Action::Open { targets, path },
             net_panes::Hop::Tree(src) => Action::Tree(src),
-            net_panes::Hop::Pods(labels) => Action::Pods { scope: o.namespace(), filter: PodFilter { crumbs: path, fields: None, labels } },
+            net_panes::Hop::Pods(labels) => Action::Pods {
+                scope: o.namespace(),
+                filter: PodFilter {
+                    crumbs: path,
+                    fields: None,
+                    labels,
+                },
+            },
         })
     }
 
@@ -479,12 +628,17 @@ impl GenericView {
         let labels = Some(panes::label_selector(&o)).filter(|s| !s.is_empty())?;
         Some(Action::Pods {
             scope: o.namespace(),
-            filter: PodFilter { crumbs: self.path_to(key), fields: None, labels: Some(labels) },
+            filter: PodFilter {
+                crumbs: self.path_to(key),
+                fields: None,
+                labels: Some(labels),
+            },
         })
     }
 
     fn open_yaml(&mut self, key: &str) {
-        let value = crate::find_in(&self.store, key).and_then(|o| serde_yaml_ng::to_value(&*o).ok());
+        let value =
+            crate::find_in(&self.store, key).and_then(|o| serde_yaml_ng::to_value(&*o).ok());
         self.yaml = value.map(|v| YamlView::new(key.to_string(), v));
     }
 }
@@ -500,18 +654,30 @@ mod tests {
     #[test]
     fn status_is_guessed_from_phase_conditions_or_state() {
         let base = r#"{"apiVersion": "x/v1", "kind": "Thing", "metadata": {"name": "a", "namespace": "n"}"#;
-        assert_eq!(dyn_status(&object(&format!(r#"{base}, "status": {{"phase": "Bound"}}}}"#))), "Bound");
+        assert_eq!(
+            dyn_status(&object(&format!(
+                r#"{base}, "status": {{"phase": "Bound"}}}}"#
+            ))),
+            "Bound"
+        );
         let ready = r#", "status": {"conditions": [{"type": "Other", "status": "False"}, {"type": "Ready", "status": "True"}]}}"#;
         assert_eq!(dyn_status(&object(&format!("{base}{ready}"))), "Ready");
         let not = r#", "status": {"conditions": [{"type": "Ready", "status": "False"}]}}"#;
         assert_eq!(dyn_status(&object(&format!("{base}{not}"))), "NotReady");
-        assert_eq!(dyn_status(&object(&format!(r#"{base}, "status": {{"state": "Pending"}}}}"#))), "Pending");
+        assert_eq!(
+            dyn_status(&object(&format!(
+                r#"{base}, "status": {{"state": "Pending"}}}}"#
+            ))),
+            "Pending"
+        );
         assert_eq!(dyn_status(&object(&format!("{base}}}"))), "");
     }
 
     #[test]
     fn all_namespaces_keys_carry_the_namespace() {
-        let o = object(r#"{"apiVersion": "x/v1", "kind": "Thing", "metadata": {"name": "a", "namespace": "n"}}"#);
+        let o = object(
+            r#"{"apiVersion": "x/v1", "kind": "Thing", "metadata": {"name": "a", "namespace": "n"}}"#,
+        );
         assert_eq!(dyn_item(&o, true, None, None).name, "n/a");
         assert_eq!(dyn_item(&o, false, None, None).name, "a");
     }
