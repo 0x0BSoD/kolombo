@@ -2036,32 +2036,35 @@ fn render_modal(
                 input,
             );
             let dim = Style::new().fg(Color::DarkGray);
-            let items: Vec<ListItem> = res_matches
-                .iter()
-                .map(|r| {
-                    let name = Style::new();
-                    let group = if r.group.is_empty() {
-                        r.version.clone()
-                    } else {
-                        format!("{}/{}", r.group, r.version)
-                    };
-                    let mut spans = vec![Span::styled(
-                        r.name.clone(),
-                        name.add_modifier(Modifier::BOLD),
-                    )];
-                    if !r.short_names.is_empty() {
-                        spans.push(Span::styled(format!(" ({})", r.aliases()), dim));
-                    }
-                    spans.push(Span::styled(format!("  {group}"), dim));
-                    ListItem::new(Line::from(spans))
-                })
-                .collect();
-            let mut state = ListState::default()
+            // Widths come from all matches, not the visible ones, so columns stay put while scrolling.
+            let width = |text: fn(&resources::ResourceInfo) -> String| {
+                let longest = res_matches.iter().map(|r| text(r).chars().count()).max();
+                Constraint::Length(longest.unwrap_or(0) as u16)
+            };
+            let widths = [
+                width(|r| r.name.clone()),
+                width(|r| r.aliases()),
+                Constraint::Fill(1),
+            ];
+            let rows = res_matches.iter().map(|r| {
+                let group = if r.group.is_empty() {
+                    r.version.clone()
+                } else {
+                    format!("{}/{}", r.group, r.version)
+                };
+                Row::new([
+                    Cell::from(r.name.clone()).style(Style::new().add_modifier(Modifier::BOLD)),
+                    Cell::from(r.aliases()).style(dim),
+                    Cell::from(group).style(dim),
+                ])
+            });
+            let mut state = TableState::default()
                 .with_selected(Some((*sel).min(res_matches.len().saturating_sub(1))));
             if list_h > 0 {
                 frame.render_stateful_widget(
-                    List::new(items)
-                        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                    Table::new(rows, widths)
+                        .column_spacing(2)
+                        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                         .block(Block::bordered().border_style(dim)),
                     list,
                     &mut state,
@@ -2398,17 +2401,37 @@ fn visible_items<'a>(items: &'a [Item], list: &ListView, matcher: &SkimMatcherV2
     visible
 }
 
-/// Items matching `query`, best fuzzy score first. Empty query keeps original order.
+/// Items matching `query`: fuzzy name hits first (best score on top), then rows where another
+/// column contains it. Empty query keeps original order.
 fn filter<'a>(items: &'a [Item], query: &str, matcher: &SkimMatcherV2) -> Vec<&'a Item> {
     if query.is_empty() {
         return items.iter().collect();
     }
-    let mut scored: Vec<(i64, &Item)> = items
+    let needle = query.to_lowercase();
+    let mut scored: Vec<(Option<i64>, &Item)> = items
         .iter()
-        .filter_map(|n| matcher.fuzzy_match(&n.name, query).map(|score| (score, n)))
+        .filter_map(|n| match matcher.fuzzy_match(&n.name, query) {
+            Some(score) => Some((Some(score), n)),
+            None => column_contains(n, &needle).then_some((None, n)),
+        })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0)); // highest score first
+    scored.sort_by(|a, b| b.0.cmp(&a.0)); // highest score first, None (column hits) last
     scored.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Substring, not fuzzy: fuzzy would match `10.1` against `10.0.0.15`. `needle` is lowercase.
+fn column_contains(item: &Item, needle: &str) -> bool {
+    let node = item
+        .node
+        .iter()
+        .flat_map(|n| [&n.roles, &n.ip, &n.version, &n.os]);
+    let image = item.pod.iter().map(|p| &p.image);
+    let extra = item.extra.iter().flatten().map(|(text, _)| text);
+    std::iter::once(&item.status)
+        .chain(node)
+        .chain(image)
+        .chain(extra)
+        .any(|v| v.to_lowercase().contains(needle))
 }
 
 /// kubectl-style age: biggest unit only (5d, 3h, 12m, 40s).
@@ -4266,6 +4289,88 @@ mod tests {
         assert_eq!(context_matches(&names, "stg"), ["staging"]);
         assert_eq!(context_matches(&names, "prod").len(), 2);
         assert!(context_matches(&names, "zzz").is_empty());
+    }
+
+    #[test]
+    fn search_covers_columns_but_ranks_name_hits_first() {
+        let item = |name: &str, status: &str, extra: &str| Item {
+            name: name.into(),
+            status: status.into(),
+            created: 0,
+            labels: vec![],
+            pod: None,
+            node: None,
+            extra: Some(vec![(extra.into(), Color::Reset)]),
+        };
+        let items = [
+            item("web", "Active", "shop.example.com"),
+            item("db", "Pending", "10.0.0.15"),
+            item("shop", "Active", "-"),
+        ];
+        let m = SkimMatcherV2::default();
+        let found = |q: &str| -> Vec<&str> {
+            filter(&items, q, &m)
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect()
+        };
+        assert_eq!(found("shop"), ["shop", "web"]); // name before host
+        assert_eq!(found("pend"), ["db"]); // status, any case
+        assert_eq!(found("0.0.15"), ["db"]);
+        assert!(found("10.1").is_empty()); // columns are not fuzzy
+
+        let mut node = item("n1", "Ready", "");
+        node.node = Some(nodes::NodeCols {
+            roles: "control-plane".into(),
+            version: "v1.30.2".into(),
+            ip: "10.0.0.5".into(),
+            os: "Ubuntu".into(),
+            cpu_alloc: None,
+            mem_alloc: None,
+            pods: 0,
+            pods_alloc: None,
+        });
+        for q in ["control", "0.0.5"] {
+            assert_eq!(filter(std::slice::from_ref(&node), q, &m).len(), 1, "{q}");
+        }
+    }
+
+    #[test]
+    fn resource_selector_aligns_its_columns() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let res = |name: &str, short: &str| resources::ResourceInfo {
+            name: name.into(),
+            short_names: vec![short.into()],
+            version: "v1".into(),
+            ..Default::default()
+        };
+        let modal = Modal::Command {
+            query: String::new(),
+            sel: 0,
+        };
+        let types = [res("pods", "po"), res("deployments", "deploy")];
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| render_modal(f, &modal, &[], &types)).unwrap();
+        let lines: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let column = |want: &str| {
+            lines
+                .iter()
+                .find_map(|l| l.find(want).map(|i| l[..i].chars().count()))
+                .unwrap_or_else(|| panic!("missing {want}"))
+        };
+        assert_eq!(column("po  "), column("deploy "));
+        let v1: Vec<usize> = lines
+            .iter()
+            .filter_map(|l| l.find("v1").map(|i| l[..i].chars().count()))
+            .collect();
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1[0], v1[1]);
     }
 
     #[test]

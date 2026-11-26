@@ -36,7 +36,7 @@ Kolombo reads your kubeconfig the same way `kubectl` does and uses its current c
 - **YAML pane** with highlighting, folding, vim keys, visual selection and copy.
 - **Edit in `$EDITOR`**, delete with confirmation, create namespaces.
 - **Cordon, uncordon and drain** (with the usual `kubectl drain` options).
-- **Fuzzy search** (`/`), sorting by name, status or age, and a namespace picker.
+- **Search** (`/`: fuzzy on the name, substring on status, roles, IPs, hosts and other columns), sorting by name, status or age, and a namespace picker.
 - **Remembers** the open resource, namespace and sort order between runs.
 
 ## Requirements
@@ -65,7 +65,7 @@ Press `?` in any view for the keys of that view. The main ones:
 | --- | --- |
 | `j` `k` / arrows | Move |
 | `Enter` | Open: namespace → pods, pod → logs, node → its pods |
-| `/` | Fuzzy search (`Esc` clears it) |
+| `/` | Search name (fuzzy) and columns (substring); `Esc` clears it |
 | `:` | Switch resource type by name or alias (`po`, `svc`, `deploy`, `no`, `ns`, CRDs…) |
 | `Ctrl+n` | Namespace picker in the pod list (first row is all namespaces); create namespace in the namespace list |
 | `< >` / `A` | Sort column / ascending or descending |
