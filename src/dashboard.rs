@@ -33,7 +33,7 @@ use std::{
     time::Duration,
 };
 
-const EVENTS: usize = 20;
+const EVENTS: usize = 50;
 
 /// Allocatable capacity, what pods request of it, and (with metrics-server) what they use.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
